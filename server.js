@@ -271,9 +271,6 @@ function buildGetProductSoap(username, password, style) {
     + '<shar:localizationCountry>US</shar:localizationCountry>'
     + '<shar:localizationLanguage>en</shar:localizationLanguage>'
     + '<shar:productId>' + style + '</shar:productId>'
-    + '<shar:partId></shar:partId>'
-    + '<shar:colorName></shar:colorName>'
-    + '<shar:ApparelSizeArray></shar:ApparelSizeArray>'
     + '</ns:GetProductRequest>'
     + '</soapenv:Body></soapenv:Envelope>';
 }
