@@ -286,50 +286,82 @@ async function getProduct(username, password, style) {
   if (!r.ok) return { error: 'SanMar HTTP ' + r.status };
 
   try {
-    var parsed = await xml2js.parseStringPromise(text, { explicitArray: false, ignoreAttrs: false });
-    var env  = findKey(parsed, 'Envelope') || parsed;
-    var body = findKey(env, 'Body') || {};
+    // Parse with explicitArray:true so we always get arrays — no type-checking needed
+    var parsed = await xml2js.parseStringPromise(text, { explicitArray: true, ignoreAttrs: true });
 
+    // Walk envelope: keys keep their XML source prefix (S:, ns2:, or none for default ns)
+    var env  = findKey(parsed,  'Envelope') || parsed;
+    var body = findKey(env,     'Body')     || {};
+
+    // Check for SOAP fault
     var fault = findKey(body, 'Fault');
-    if (fault) return { error: 'SOAP fault: ' + safeStr(fault.faultstring || fault.message || '') };
-
-    var resp = findKey(body, 'GetProductResponse') || findKey(body, 'ProductResponse');
-    if (!resp) return { error: 'No product response', rawStart: text.substring(0, 400) };
-
-    var errCode = safeStr(findKey(resp, 'errorCode') || '');
-    if (errCode && errCode !== '0') {
-      return { error: 'SanMar error ' + errCode + ': ' + safeStr(findKey(resp, 'description') || '') };
+    if (fault) {
+      var faultArr = Array.isArray(fault) ? fault : [fault];
+      var fs = arrVal(faultArr[0], 'faultstring');
+      return { error: 'SOAP fault: ' + fs };
     }
 
-    var product = findKey(resp, 'Product');
-    if (!product) return { error: 'Product ' + style + ' not found' };
+    var resp = findKey(body, 'GetProductResponse');
+    if (!resp) return { error: 'No GetProductResponse in reply', rawStart: text.substring(0, 400) };
+    var respObj = Array.isArray(resp) ? resp[0] : resp;
 
-    var name        = safeStr(findKey(product, 'productName') || style);
-    var description = safeStr(findKey(product, 'description') || '');
+    // PromoStandards error check
+    var ec = arrVal(respObj, 'errorCode');
+    if (ec && ec !== '0') {
+      return { error: 'SanMar error ' + ec + ': ' + arrVal(respObj, 'description') };
+    }
+
+    var productArr = findKey(respObj, 'Product');
+    if (!productArr) return { error: 'Product ' + style + ' not found' };
+    var product = Array.isArray(productArr) ? productArr[0] : productArr;
+
+    // productName is a single tag -> ['Port & Co...'] with explicitArray:true
+    var name = arrVal(product, 'productName') || style;
+
+    // description is MULTIPLE tags -> array of strings; join them
+    var descRaw = findKey(product, 'description') || [];
+    var descArr = Array.isArray(descRaw) ? descRaw : [descRaw];
+    var description = descArr.map(function(d) {
+      return typeof d === 'string' ? d.trim() : (d && d['_'] ? d['_'].trim() : '');
+    }).filter(Boolean).join(' ');
+
+    // Colors and sizes from ProductPartArray
     var colors = [], sizes = [];
+    var partArrayRaw = findKey(product, 'ProductPartArray');
+    if (partArrayRaw) {
+      var partArrayObj = Array.isArray(partArrayRaw) ? partArrayRaw[0] : partArrayRaw;
+      var partsRaw = findKey(partArrayObj, 'ProductPart') || [];
+      var parts = Array.isArray(partsRaw) ? partsRaw : [partsRaw];
 
-    var partArray = findKey(product, 'ProductPartArray') || {};
-    var parts = findKey(partArray, 'ProductPart') || [];
-    if (!Array.isArray(parts)) parts = [parts];
-
-    parts.filter(Boolean).forEach(function(part) {
-      var colorArray = findKey(part, 'ColorArray') || {};
-      var colorObjs  = findKey(colorArray, 'Color') || [];
-      if (!Array.isArray(colorObjs)) colorObjs = [colorObjs];
-      colorObjs.filter(Boolean).forEach(function(c) {
-        var cn = safeStr(findKey(c, 'colorName') || c);
-        if (cn && colors.indexOf(cn) < 0) colors.push(cn);
+      parts.filter(Boolean).forEach(function(part) {
+        // Colors
+        var colorArrayRaw = findKey(part, 'ColorArray');
+        if (colorArrayRaw) {
+          var colorArrayObj = Array.isArray(colorArrayRaw) ? colorArrayRaw[0] : colorArrayRaw;
+          var colorObjs = findKey(colorArrayObj, 'Color') || [];
+          if (!Array.isArray(colorObjs)) colorObjs = [colorObjs];
+          colorObjs.filter(Boolean).forEach(function(c) {
+            var cn = arrVal(c, 'colorName');
+            if (cn && colors.indexOf(cn) < 0) colors.push(cn);
+          });
+        }
+        // Sizes
+        var sizeRaw = findKey(part, 'ApparelSize');
+        if (sizeRaw) {
+          var sizeObj = Array.isArray(sizeRaw) ? sizeRaw[0] : sizeRaw;
+          var lbl = arrVal(sizeObj, 'labelSize');
+          if (lbl && sizes.indexOf(lbl) < 0) sizes.push(lbl);
+        }
       });
-      var sizeObj = findKey(part, 'ApparelSize') || {};
-      var lbl     = safeStr(findKey(sizeObj, 'labelSize') || '');
-      if (lbl && sizes.indexOf(lbl) < 0) sizes.push(lbl);
-    });
+    }
 
     return { style: style, name: name, description: description, colors: colors, sizes: sizes };
+
   } catch(e) {
     return { error: 'Parse error: ' + e.message, rawStart: text.substring(0, 400) };
   }
 }
+
 
 async function getPricing(username, password, customerNumber, style, color) {
   var soap = '<?xml version="1.0" encoding="UTF-8"?>'
@@ -430,8 +462,18 @@ function findKey(obj, name) {
 function safeStr(val) {
   if (val === null || val === undefined) return '';
   if (typeof val === 'string') return val.trim();
+  if (Array.isArray(val)) return val.length > 0 ? safeStr(val[0]) : '';
   if (typeof val === 'object' && val['_']) return String(val['_']).trim();
   return '';
+}
+
+// Get first value from an explicitArray:true parsed object key
+function arrVal(obj, key) {
+  if (!obj) return '';
+  var found = findKey(obj, key);
+  if (!found) return '';
+  if (Array.isArray(found)) return safeStr(found[0]);
+  return safeStr(found);
 }
 
 // ─────────────────────────────────────
