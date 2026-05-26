@@ -115,6 +115,42 @@ app.post('/api/test', async function(req, res) {
 // DEBUG — raw SOAP response
 // POST { username, password, style }
 // ─────────────────────────────────────
+app.post('/api/debug-pricing', async function(req, res) {
+  try {
+    var username       = req.body.username;
+    var password       = req.body.password;
+    var customerNumber = req.body.customerNumber || '';
+    var style          = (req.body.style || 'PC61').toUpperCase();
+    var color          = req.body.color || 'White';
+    if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
+    var soap = '<?xml version="1.0" encoding="UTF-8"?>'
+      + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://webservice.integration.sanmar.com/">'
+      + '<soapenv:Header/><soapenv:Body>'
+      + '<san:getPricing><san:arg0>'
+      + '<san:style>' + style + '</san:style>'
+      + '<san:color>' + color + '</san:color>'
+      + '<san:sizeIndex>0</san:sizeIndex>'
+      + '<san:caseQty>0</san:caseQty>'
+      + '<san:userInfo>'
+      + '<san:sanMarCustomerNumber>' + customerNumber + '</san:sanMarCustomerNumber>'
+      + '<san:sanMarUserName>' + username + '</san:sanMarUserName>'
+      + '<san:sanMarUserPassword>' + password + '</san:sanMarUserPassword>'
+      + '</san:userInfo>'
+      + '</san:arg0></san:getPricing>'
+      + '</soapenv:Body></soapenv:Envelope>';
+    var r = await fetch(SM_PRICING, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
+      body: soap,
+      timeout: 15000
+    });
+    var text = await r.text();
+    res.json({ httpStatus: r.status, httpOk: r.ok, rawXml: text.substring(0, 4000) });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
 app.post('/api/debug', async function(req, res) {
   try {
     var username = req.body.username;
@@ -365,9 +401,7 @@ async function getProduct(username, password, style) {
 
 async function getPricing(username, password, customerNumber, style, color) {
   var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-    + '<soapenv:Envelope'
-    + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
-    + ' xmlns:san="http://webservice.integration.sanmar.com/">'
+    + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://webservice.integration.sanmar.com/">'
     + '<soapenv:Header/><soapenv:Body>'
     + '<san:getPricing><san:arg0>'
     + '<san:style>' + style + '</san:style>'
@@ -389,44 +423,69 @@ async function getPricing(username, password, customerNumber, style, color) {
     timeout: 15000
   });
   var text = await r.text();
-  if (!r.ok) return { error: 'SanMar pricing HTTP ' + r.status };
+  if (!r.ok) return { error: 'SanMar pricing HTTP ' + r.status, rawStart: text.substring(0, 400) };
 
   try {
-    var parsed = await xml2js.parseStringPromise(text, { explicitArray: false, ignoreAttrs: false });
+    var parsed = await xml2js.parseStringPromise(text, { explicitArray: true, ignoreAttrs: true });
     var env  = findKey(parsed, 'Envelope') || parsed;
-    var body = findKey(env, 'Body') || {};
+    var body = findKey(env,    'Body')     || {};
+
     var fault = findKey(body, 'Fault');
-    if (fault) return { error: 'SOAP fault: ' + safeStr(fault.faultstring || '') };
-
-    var resp = findKey(body, 'getPricingResponse') || Object.values(body)[0];
-    if (!resp) return { error: 'No pricing response' };
-
-    var ret = findKey(resp, 'return') || resp;
-    if (safeStr(findKey(ret, 'errorOccurred')) === 'true') {
-      return { error: safeStr(findKey(ret, 'message') || 'Pricing error') };
+    if (fault) {
+      var fArr = Array.isArray(fault) ? fault : [fault];
+      return { error: 'SOAP fault: ' + arrVal(fArr[0], 'faultstring') };
     }
 
+    // SanMar pricing response: <ns2:getPricingResponse><return>...</return></ns2:getPricingResponse>
+    var resp = findKey(body, 'getPricingResponse');
+    if (!resp) return { error: 'No pricing response', rawStart: text.substring(0, 400) };
+    var respObj = Array.isArray(resp) ? resp[0] : resp;
+
+    var retArr = findKey(respObj, 'return');
+    if (!retArr) return { error: 'No return element in pricing response', rawStart: text.substring(0, 400) };
+    var ret = Array.isArray(retArr) ? retArr[0] : retArr;
+
+    // Check for error
+    var errOccurred = arrVal(ret, 'errorOccurred');
+    if (errOccurred === 'true') {
+      return { error: arrVal(ret, 'message') || 'Pricing error from SanMar' };
+    }
+
+    // Build size->price map from responseList array
     var pricing = {};
     var sizeNames = ['XS','S','M','L','XL','2XL','3XL','4XL','5XL','6XL'];
-    var items = findKey(ret, 'responseList') || [];
-    if (!Array.isArray(items)) items = [items];
+    var listRaw = findKey(ret, 'responseList') || [];
+    var items = Array.isArray(listRaw) ? listRaw : [listRaw];
+
     items.filter(Boolean).forEach(function(item, i) {
-      var price = parseFloat(safeStr(findKey(item, 'ourPriceA') || findKey(item, 'piecePrice') || 0));
-      var sz    = safeStr(findKey(item, 'size') || sizeNames[i] || '');
+      // Try multiple possible price field names
+      var price = parseFloat(
+        arrVal(item, 'ourPriceA') ||
+        arrVal(item, 'piecePrice') ||
+        arrVal(item, 'salePrice') ||
+        '0'
+      );
+      var sz = arrVal(item, 'size') || sizeNames[i] || '';
       if (price > 0 && sz) pricing[sz] = price;
     });
 
-    var c = function(s) { return pricing[s] || null; };
+    // Convenience fields
+    function p(s) { return pricing[s] || null; }
+    var sxl = p('S') || p('M') || p('L') || p('XL') || null;
+
     return {
       style: style, color: color,
-      priceSXL: c('S') || c('M') || c('L') || c('XL'),
-      price2XL: c('2XL'), price3XL: c('3XL'), price4XL: c('4XL'),
+      priceSXL: sxl,
+      price2XL: p('2XL'),
+      price3XL: p('3XL'),
+      price4XL: p('4XL'),
       raw: Object.keys(pricing).length > 0 ? pricing : null
     };
   } catch(e) {
-    return { error: 'Pricing parse error: ' + e.message };
+    return { error: 'Pricing parse error: ' + e.message, rawStart: text.substring(0, 400) };
   }
 }
+
 
 async function fetchImageB64(style, color) {
   var c = (color || '').replace(/\s+/g, '_').toUpperCase();
