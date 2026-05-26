@@ -123,29 +123,47 @@ app.post('/api/debug-pricing', async function(req, res) {
     var style          = (req.body.style || 'PC61').toUpperCase();
     var color          = req.body.color || 'White';
     if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
-    var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-      + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://impl.webservice.integration.sanmar.com/">'
-      + '<soapenv:Header/><soapenv:Body>'
-      + '<san:getPricing><san:arg0>'
-      + '<san:style>' + style + '</san:style>'
-      + '<san:color>' + color + '</san:color>'
-      + '<san:sizeIndex>0</san:sizeIndex>'
-      + '<san:caseQty>0</san:caseQty>'
-      + '<san:userInfo>'
-      + '<san:sanMarCustomerNumber>' + customerNumber + '</san:sanMarCustomerNumber>'
-      + '<san:sanMarUserName>' + username + '</san:sanMarUserName>'
-      + '<san:sanMarUserPassword>' + password + '</san:sanMarUserPassword>'
-      + '</san:userInfo>'
-      + '</san:arg0></san:getPricing>'
-      + '</soapenv:Body></soapenv:Envelope>';
-    var r = await fetch(SM_PRICING, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
-      body: soap,
-      timeout: 15000
-    });
-    var text = await r.text();
-    res.json({ httpStatus: r.status, httpOk: r.ok, rawXml: text.substring(0, 4000) });
+    // Try multiple variations to find what SanMar accepts
+    var results = {};
+    var variations = [
+      { sizeIndex: '1', caseQty: '0', color: color },
+      { sizeIndex: '0', caseQty: '0', color: color },
+      { sizeIndex: '1', caseQty: '1', color: color },
+      { sizeIndex: '1', caseQty: '0', color: '' },
+    ];
+    for (var vi = 0; vi < variations.length; vi++) {
+      var v = variations[vi];
+      var soap = '<?xml version="1.0" encoding="UTF-8"?>'
+        + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://impl.webservice.integration.sanmar.com/">'
+        + '<soapenv:Header/><soapenv:Body>'
+        + '<san:getPricing><san:arg0>'
+        + '<san:style>' + style + '</san:style>'
+        + '<san:color>' + v.color + '</san:color>'
+        + '<san:sizeIndex>' + v.sizeIndex + '</san:sizeIndex>'
+        + '<san:caseQty>' + v.caseQty + '</san:caseQty>'
+        + '<san:userInfo>'
+        + '<san:sanMarCustomerNumber>' + customerNumber + '</san:sanMarCustomerNumber>'
+        + '<san:sanMarUserName>' + username + '</san:sanMarUserName>'
+        + '<san:sanMarUserPassword>' + password + '</san:sanMarUserPassword>'
+        + '</san:userInfo>'
+        + '</san:arg0></san:getPricing>'
+        + '</soapenv:Body></soapenv:Envelope>';
+      try {
+        var r = await fetch(SM_PRICING, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
+          body: soap,
+          timeout: 15000
+        });
+        var text = await r.text();
+        var key = 'variation_' + (vi+1) + '_sizeIdx' + v.sizeIndex + '_caseQty' + v.caseQty + '_color_' + (v.color||'empty');
+        results[key] = { httpStatus: r.status, rawXml: text.substring(0, 1500) };
+        if (r.ok && !text.includes('NullPointer') && !text.includes('Fault')) break;
+      } catch(e) {
+        results['variation_' + (vi+1)] = { error: e.message };
+      }
+    }
+    res.json(results);
   } catch(e) {
     res.json({ error: e.message });
   }
@@ -190,9 +208,15 @@ app.post('/api/product', async function(req, res) {
     var style    = (req.body.style || '').toUpperCase();
     if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
     var data = await getProduct(username, password, style);
-    res.json(data);
+    // Safely serialize - strip any non-JSON-safe values
+    var safe = JSON.parse(JSON.stringify(data, function(k, v) {
+      if (v === undefined || typeof v === 'function') return null;
+      return v;
+    }));
+    res.json(safe);
   } catch(e) {
-    res.json({ error: e.message });
+    console.error('Product route error:', e);
+    res.status(500).json({ error: e.message, stack: e.stack ? e.stack.split('\n').slice(0,3).join(' | ') : '' });
   }
 });
 
@@ -212,9 +236,14 @@ app.post('/api/pricing', async function(req, res) {
     if (!customerNumber) return res.status(400).json({ error: 'Customer number required for pricing. Add it in Settings.' });
 
     var data = await getPricing(username, password, customerNumber, style, color);
-    res.json(data);
+    var safe = JSON.parse(JSON.stringify(data, function(k, v) {
+      if (v === undefined || typeof v === 'function') return null;
+      return v;
+    }));
+    res.json(safe);
   } catch(e) {
-    res.json({ error: e.message });
+    console.error('Pricing route error:', e);
+    res.status(500).json({ error: e.message, stack: e.stack ? e.stack.split('\n').slice(0,3).join(' | ') : '' });
   }
 });
 
@@ -394,7 +423,7 @@ async function getProduct(username, password, style) {
     return { style: style, name: name, description: description, colors: colors, sizes: sizes };
 
   } catch(e) {
-    return { error: 'Parse error: ' + e.message, rawStart: text.substring(0, 400) };
+    return { error: 'Parse error: ' + e.message + ' at: ' + (e.stack||'').split('\n')[1], rawStart: text.substring(0, 600) };
   }
 }
 
@@ -406,7 +435,7 @@ async function getPricing(username, password, customerNumber, style, color) {
     + '<san:getPricing><san:arg0>'
     + '<san:style>' + style + '</san:style>'
     + '<san:color>' + color + '</san:color>'
-    + '<san:sizeIndex>0</san:sizeIndex>'
+    + '<san:sizeIndex>1</san:sizeIndex>'
     + '<san:caseQty>0</san:caseQty>'
     + '<san:userInfo>'
     + '<san:sanMarCustomerNumber>' + customerNumber + '</san:sanMarCustomerNumber>'
