@@ -1,349 +1,443 @@
 /**
- * HVP SanMar Proxy Server
- * Handles CORS-blocked SanMar SOAP API calls on behalf of the browser.
- * Deploy to Render.com (free tier) — see README for instructions.
+ * HVP SanMar Proxy Server v4
+ * Per SanMar Web Services Integration Guide v24.3
+ *
+ * CREDENTIAL NOTES:
+ * - This proxy uses your sanmar.com USERNAME + PASSWORD (web services)
+ * - FTP credentials are DIFFERENT - not used here
+ * - Web services must be enabled: email sanmarintegrations@sanmar.com
  */
 
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
-const xml2js = require('xml2js');
+'use strict';
 
-const app = express();
+const express = require('express');
+const cors    = require('cors');
+const fetch   = require('node-fetch');
+const xml2js  = require('xml2js');
+
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// Allow requests from anywhere (the quote tool can be opened from any machine)
 app.use(cors());
 app.use(express.json());
 
-// ── SanMar SOAP endpoints ──
-const SM_PRODUCT_URL  = 'https://ws.sanmar.com:8080/promostandards/ProductDataService/ProductDataServiceBinding?WSDL';
-const SM_PRICING_URL  = 'https://ws.sanmar.com:8080/SanMarWebService/SanMarPricingServicePort?wsdl';
-const SM_IMG_CDN      = 'https://cdnl.sanmar.com/catalog/images/imglib/mresjpg/';
-
-// ── Health check ──
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'HVP SanMar Proxy', version: '1.0.0' });
+// Always return JSON, never crash the process
+process.on('unhandledRejection', function(reason) {
+  console.error('Unhandled rejection:', reason);
+});
+process.on('uncaughtException', function(err) {
+  console.error('Uncaught exception:', err);
 });
 
-// ── Test credentials ──
-app.post('/api/test', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
+// ── SanMar endpoints ──
+const PS_PRODUCT  = 'https://ws.sanmar.com:8080/promostandards/ProductDataServiceBindingV2';
+const SM_PRICING  = 'https://ws.sanmar.com:8080/SanMarWebService/SanMarPricingServicePort';
+const SM_IMG_BASE = 'https://cdnl.sanmar.com/catalog/images/imglib/mresjpg/';
 
+// ─────────────────────────────────────
+// HEALTH / PING
+// ─────────────────────────────────────
+app.get('/', function(req, res) {
+  res.json({ status: 'ok', service: 'HVP SanMar Proxy', version: '4.0.0' });
+});
+
+// Render free tier keep-alive ping
+app.get('/ping', function(req, res) {
+  res.json({ pong: true, time: new Date().toISOString() });
+});
+
+// ─────────────────────────────────────
+// TEST CREDENTIALS
+// POST { username, password }
+// ─────────────────────────────────────
+app.post('/api/test', async function(req, res) {
   try {
-    const result = await callProductSOAP(username, password, 'PC61');
-    if (result.error) return res.status(401).json({ error: 'Invalid credentials or SanMar unreachable', detail: result.error });
-    res.json({ ok: true, message: 'Credentials valid — SanMar connection working.' });
-  } catch (e) {
-    res.status(500).json({ error: 'Connection failed', detail: e.message });
-  }
-});
+    var username = req.body.username;
+    var password = req.body.password;
 
-// ── Product lookup: style info + colors + image URLs ──
-app.post('/api/product', async (req, res) => {
-  const { username, password, style } = req.body;
-  if (!username || !password || !style) return res.status(400).json({ error: 'Missing username, password, or style' });
-
-  try {
-    const data = await callProductSOAP(username, password, style.toUpperCase());
-    if (data.error) return res.status(404).json({ error: data.error });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: 'Product lookup failed', detail: e.message });
-  }
-});
-
-// ── Pricing lookup: cost per size for a style+color ──
-app.post('/api/pricing', async (req, res) => {
-  const { username, password, style, color } = req.body;
-  if (!username || !password || !style) return res.status(400).json({ error: 'Missing required fields' });
-
-  try {
-    const data = await callPricingSOAP(username, password, style.toUpperCase(), color || '');
-    if (data.error) return res.status(404).json({ error: data.error });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: 'Pricing lookup failed', detail: e.message });
-  }
-});
-
-// ── Image proxy: fetches SanMar CDN image and returns as base64 ──
-app.get('/api/image/:style', async (req, res) => {
-  const style = req.params.style.toUpperCase();
-  const color = req.query.color || style;
-
-  // Try multiple SanMar image URL patterns
-  const urls = [
-    `${SM_IMG_CDN}${style}_${color.replace(/\s+/g, '_').toUpperCase()}.jpg`,
-    `${SM_IMG_CDN}${style}_${style}.jpg`,
-    `${SM_IMG_CDN}${style.toLowerCase()}_${style.toLowerCase()}.jpg`,
-  ];
-
-  for (const url of urls) {
-    try {
-      const resp = await fetch(url, { timeout: 8000 });
-      if (resp.ok) {
-        const buffer = await resp.buffer();
-        if (buffer.length > 1000) {
-          const b64 = buffer.toString('base64');
-          return res.json({ 
-            style, 
-            imageUrl: url,
-            imageB64: b64,
-            mimeType: 'image/jpeg'
-          });
-        }
-      }
-    } catch (e) { /* try next */ }
-  }
-
-  res.status(404).json({ error: 'Image not found for style ' + style });
-});
-
-// ═══════════════════════════════════════
-// SOAP HELPERS
-// ═══════════════════════════════════════
-
-async function callProductSOAP(username, password, style) {
-  // SanMar PromoStandards Product Data Service v2.0.0
-  const soapBody = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:ns="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/"
-  xmlns:shared="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/SharedObjects/">
-  <soapenv:Header/>
-  <soapenv:Body>
-    <ns:GetProductRequest>
-      <ns:wsVersion>2.0.0</ns:wsVersion>
-      <ns:id>${username}</ns:id>
-      <ns:password>${password}</ns:password>
-      <ns:localizationCountry>US</ns:localizationCountry>
-      <ns:localizationLanguage>en</ns:localizationLanguage>
-      <ns:productId>${style}</ns:productId>
-      <ns:partId></ns:partId>
-      <ns:colorName></ns:colorName>
-      <ns:ApparelSizeArray></ns:ApparelSizeArray>
-    </ns:GetProductRequest>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const resp = await fetch(SM_PRODUCT_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/xml; charset=utf-8',
-      'SOAPAction': 'GetProduct',
-    },
-    body: soapBody,
-    timeout: 15000,
-  });
-
-  const text = await resp.text();
-  
-  if (!resp.ok) {
-    return { error: `SanMar returned HTTP ${resp.status}` };
-  }
-
-  try {
-    const parsed = await xml2js.parseStringPromise(text, { explicitArray: false, ignoreAttrs: true });
-    
-    // Navigate the SOAP response
-    const env = parsed['soapenv:Envelope'] || parsed['soap:Envelope'] || parsed['Envelope'];
-    const body = env && (env['soapenv:Body'] || env['soap:Body'] || env['Body']);
-    
-    if (!body) return { error: 'Invalid SOAP response' };
-    
-    // Check for fault
-    const fault = body['soapenv:Fault'] || body['soap:Fault'] || body['Fault'];
-    if (fault) {
-      const msg = fault.faultstring || fault.message || 'Unknown SOAP fault';
-      return { error: String(msg) };
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Missing username or password' });
     }
 
-    const getResp = body['ns2:GetProductResponse'] || body['GetProductResponse'] || 
-                    Object.values(body)[0];
-    
-    if (!getResp) return { error: 'No product response in SOAP body' };
+    var soap = '<?xml version="1.0" encoding="UTF-8"?>'
+      + '<soapenv:Envelope'
+      + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+      + ' xmlns:ns="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/"'
+      + ' xmlns:shar="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/SharedObjects/">'
+      + '<soapenv:Header/><soapenv:Body>'
+      + '<ns:GetProductSellableRequest>'
+      + '<shar:wsVersion>2.0.0</shar:wsVersion>'
+      + '<shar:id>' + username + '</shar:id>'
+      + '<shar:password>' + password + '</shar:password>'
+      + '<shar:productId>PC61</shar:productId>'
+      + '<shar:isSellable>true</shar:isSellable>'
+      + '</ns:GetProductSellableRequest>'
+      + '</soapenv:Body></soapenv:Envelope>';
 
-    // Extract product info
-    const product = getResp.Product || getResp.product;
-    if (!product) return { error: 'Product not found: ' + style };
-
-    const productName = product.productName || product.ProductName || style;
-    const description = product.description || product.Description || '';
-
-    // Extract colors from ProductPartArray
-    const colors = [];
-    const partArray = product.ProductPartArray || {};
-    const parts = partArray.ProductPart || [];
-    const partsArr = Array.isArray(parts) ? parts : [parts];
-
-    partsArr.forEach(part => {
-      if (!part) return;
-      const colorName = (part.ColorArray && part.ColorArray.Color && part.ColorArray.Color.colorName) 
-                        || part.colorName || '';
-      if (colorName && !colors.includes(colorName)) colors.push(colorName);
+    var r = await fetch(PS_PRODUCT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'GetProductSellable' },
+      body: soap,
+      timeout: 15000
     });
 
-    return {
-      style: style,
-      name: productName,
-      description: description,
-      colors: colors,
-    };
+    var text = await r.text();
+    var lower = text.toLowerCase();
 
-  } catch (e) {
-    return { error: 'Failed to parse SanMar response: ' + e.message };
+    if (r.status === 403) {
+      return res.json({ error: 'HTTP 403 from SanMar. Your account may not have web services enabled yet. Email sanmarintegrations@sanmar.com with your customer number to request access.' });
+    }
+    if (r.status === 401) {
+      return res.json({ error: 'HTTP 401 - Invalid credentials. Use your sanmar.com username and password (not FTP credentials).' });
+    }
+    if (!r.ok) {
+      return res.json({ error: 'SanMar returned HTTP ' + r.status, rawStart: text.substring(0, 300) });
+    }
+    if (lower.includes('errorcode>105') || lower.includes('errorcode>100') || (lower.includes('authentication') && lower.includes('fail'))) {
+      return res.json({ error: 'Authentication failed. Check your sanmar.com username and password. Note: web services must be separately enabled by emailing sanmarintegrations@sanmar.com.' });
+    }
+    if (lower.includes('errorcode>104') || lower.includes('unauthorized')) {
+      return res.json({ error: 'Account not authorized for web services. Email sanmarintegrations@sanmar.com to enable access (1-2 business days).' });
+    }
+    if (lower.includes('fault')) {
+      var fm = text.match(/<faultstring[^>]*>([^<]+)<\/faultstring>/i);
+      return res.json({ error: 'SOAP fault: ' + (fm ? fm[1] : 'unknown'), rawStart: text.substring(0, 300) });
+    }
+
+    res.json({ ok: true, message: 'Connected to SanMar. Credentials valid.' });
+
+  } catch(e) {
+    res.json({ error: 'Proxy error: ' + e.message });
   }
-}
-
-async function callPricingSOAP(username, password, style, color) {
-  // SanMar Pricing Service
-  const soapBody = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:san="http://www.sanmar.com/webservice">
-  <soapenv:Header/>
-  <soapenv:Body>
-    <san:getPricingAndAvailability>
-      <san:arg0>
-        <san:style>${style}</san:style>
-        <san:color>${color}</san:color>
-        <san:sizeIndex>0</san:sizeIndex>
-        <san:caseQty>0</san:caseQty>
-        <san:userInfo>
-          <san:userName>${username}</san:userName>
-          <san:userPassword>${password}</san:userPassword>
-        </san:userInfo>
-      </san:arg0>
-    </san:getPricingAndAvailability>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const resp = await fetch(SM_PRICING_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/xml; charset=utf-8',
-      'SOAPAction': 'getPricingAndAvailability',
-    },
-    body: soapBody,
-    timeout: 15000,
-  });
-
-  const text = await resp.text();
-  if (!resp.ok) return { error: `SanMar pricing returned HTTP ${resp.status}` };
-
-  try {
-    const parsed = await xml2js.parseStringPromise(text, { explicitArray: false, ignoreAttrs: true });
-    const env = parsed['soapenv:Envelope'] || parsed['soap:Envelope'] || parsed['Envelope'];
-    const body = env && (env['soapenv:Body'] || env['soap:Body'] || env['Body']);
-    if (!body) return { error: 'Invalid pricing response' };
-
-    const fault = body['soapenv:Fault'] || body['soap:Fault'] || body['Fault'];
-    if (fault) return { error: String(fault.faultstring || 'Pricing fault') };
-
-    // Extract pricing — navigate to the response data
-    const returnObj = body['ns2:getPricingAndAvailabilityResponse'] || 
-                      body['getPricingAndAvailabilityResponse'] ||
-                      Object.values(body)[0];
-
-    const returnVal = returnObj && (returnObj['return'] || returnObj.return);
-    if (!returnVal) return { error: 'No pricing data returned' };
-
-    // Build size->price map
-    const pricing = {};
-    const listPrice = returnVal.listPrice || {};
-    
-    // SanMar returns prices by size index; map to size names
-    const sizeNames = ['XS','S','M','L','XL','2XL','3XL','4XL','5XL','6XL'];
-    const prices = Array.isArray(listPrice) ? listPrice : [listPrice];
-    
-    prices.forEach((p, i) => {
-      const size = sizeNames[i] || ('Size'+(i+1));
-      const price = parseFloat(p.price || p._ || p) || 0;
-      if (price > 0) pricing[size] = price;
-    });
-
-    // Also try to get a simpler structure
-    const priceSXL = parseFloat(returnVal.priceSXL || returnVal.price || 0);
-    const price2XL = parseFloat(returnVal.price2XL || 0);
-    const price3XL = parseFloat(returnVal.price3XL || 0);
-    const price4XL = parseFloat(returnVal.price4XL || 0);
-
-    return {
-      style, color,
-      pricing,
-      // Convenience fields if SanMar returns them directly
-      priceSXL: priceSXL || null,
-      price2XL: price2XL || null,
-      price3XL: price3XL || null,
-      price4XL: price4XL || null,
-      raw: Object.keys(pricing).length > 0 ? pricing : null,
-    };
-
-  } catch (e) {
-    return { error: 'Failed to parse pricing response: ' + e.message };
-  }
-}
-
-// ── Start ──
-app.listen(PORT, () => {
-  console.log(`HVP SanMar Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/`);
 });
 
-// ── Spec sheet: fabric, features, colors, sizes for a style ──
-app.post('/api/specsheet', async (req, res) => {
-  const { username, password, style } = req.body;
-  if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
-
+// ─────────────────────────────────────
+// DEBUG — raw SOAP response
+// POST { username, password, style }
+// ─────────────────────────────────────
+app.post('/api/debug', async function(req, res) {
   try {
-    // Get product data from SanMar which contains fabric/feature info
-    const productData = await callProductSOAP(username, password, style.toUpperCase());
-    if (productData.error) return res.status(404).json({ error: productData.error });
+    var username = req.body.username;
+    var password = req.body.password;
+    var style    = (req.body.style || 'PC61').toUpperCase();
 
-    // Also fetch the image
-    let imageB64 = null;
-    const imgUrls = [
-      `${SM_IMG_CDN}${style.toUpperCase()}_${style.toUpperCase()}.jpg`,
-      `${SM_IMG_CDN}${style.toLowerCase()}_${style.toLowerCase()}.jpg`,
+    if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
+
+    var soap = buildGetProductSoap(username, password, style);
+    var r = await fetch(PS_PRODUCT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'GetProduct' },
+      body: soap,
+      timeout: 15000
+    });
+    var text = await r.text();
+    res.json({
+      httpStatus: r.status,
+      httpOk: r.ok,
+      rawXml: text.substring(0, 3000),
+      hasError: text.toLowerCase().includes('fault') || text.toLowerCase().includes('error'),
+      hasProduct: text.toLowerCase().includes('product')
+    });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────
+// PRODUCT LOOKUP
+// POST { username, password, style }
+// ─────────────────────────────────────
+app.post('/api/product', async function(req, res) {
+  try {
+    var username = req.body.username;
+    var password = req.body.password;
+    var style    = (req.body.style || '').toUpperCase();
+    if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
+    var data = await getProduct(username, password, style);
+    res.json(data);
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────
+// PRICING LOOKUP
+// POST { username, password, customerNumber, style, color }
+// ─────────────────────────────────────
+app.post('/api/pricing', async function(req, res) {
+  try {
+    var username       = req.body.username;
+    var password       = req.body.password;
+    var customerNumber = req.body.customerNumber;
+    var style          = (req.body.style || '').toUpperCase();
+    var color          = req.body.color || '';
+
+    if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
+    if (!customerNumber) return res.status(400).json({ error: 'Customer number required for pricing. Add it in Settings.' });
+
+    var data = await getPricing(username, password, customerNumber, style, color);
+    res.json(data);
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────
+// IMAGE PROXY
+// GET /api/image/:style?color=Navy
+// ─────────────────────────────────────
+app.get('/api/image/:style', async function(req, res) {
+  try {
+    var style = req.params.style.toUpperCase();
+    var color = (req.query.color || '').replace(/\s+/g, '_').toUpperCase();
+    var urls = [
+      SM_IMG_BASE + style + '_' + (color || style) + '.jpg',
+      SM_IMG_BASE + style + '_' + style + '.jpg',
+      SM_IMG_BASE + style.toLowerCase() + '_' + style.toLowerCase() + '.jpg'
     ];
-    for (const url of imgUrls) {
+    for (var i = 0; i < urls.length; i++) {
       try {
-        const r = await fetch(url, { timeout: 6000 });
+        var r = await fetch(urls[i], { timeout: 8000 });
         if (r.ok) {
-          const buf = await r.buffer();
-          if (buf.length > 1000) { imageB64 = buf.toString('base64'); break; }
+          var buf = await r.buffer();
+          if (buf.length > 1000) {
+            return res.json({ style: style, imageUrl: urls[i], imageB64: buf.toString('base64'), mimeType: 'image/jpeg' });
+          }
         }
-      } catch (e) {}
+      } catch(e) { /* try next */ }
     }
+    res.status(404).json({ error: 'Image not found for ' + style });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
 
-    // Parse features from SanMar product description
-    const descText = productData.description || '';
-    const features = descText
-      .split(/[.\n]/)
-      .map(s => s.trim())
-      .filter(s => s.length > 8 && s.length < 120);
+// ─────────────────────────────────────
+// SPEC SHEET
+// POST { username, password, style }
+// ─────────────────────────────────────
+app.post('/api/specsheet', async function(req, res) {
+  try {
+    var username = req.body.username;
+    var password = req.body.password;
+    var style    = (req.body.style || '').toUpperCase();
+    if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
 
-    // Extract fabric weight from description
-    const weightMatch = descText.match(/(\d+(?:\.\d+)?\s*(?:oz|g\/m2|gsm)[^,.\n]*)/i);
-    const weight = weightMatch ? weightMatch[1].trim() : null;
+    var results = await Promise.all([
+      getProduct(username, password, style),
+      fetchImageB64(style, '')
+    ]);
+    var productData = results[0];
+    var imgB64      = results[1];
 
-    // Fabric content
-    const fabricMatch = descText.match(/(\d+%[^.\n]+(?:cotton|polyester|fleece|blend|jersey|pique)[^.\n]*)/i);
-    const fabric = fabricMatch ? fabricMatch[1].trim() : null;
+    if (productData.error) return res.status(404).json(productData);
+
+    var desc = productData.description || '';
+    var wm   = desc.match(/(\d+(?:\.\d+)?\s*(?:oz|g\/m2|gsm)[^,.\n]*)/i);
+    var fm   = desc.match(/(\d+%[^.\n]{3,60}(?:cotton|polyester|fleece|blend|jersey|pique|spandex)[^.\n]*)/i);
+    var feats = desc.split(/[.\n]/).map(function(s){ return s.trim(); }).filter(function(s){ return s.length > 10 && s.length < 140; });
 
     res.json({
-      style: style.toUpperCase(),
+      style: style,
       name: productData.name,
-      description: productData.description,
-      fabric: fabric,
-      weight: weight,
-      features: features.slice(0, 8),
+      description: desc,
+      fabric: fm ? fm[1].trim() : null,
+      weight: wm ? wm[1].trim() : null,
+      features: feats.slice(0, 8),
       colors: productData.colors || [],
-      sizes: ['XS','S','M','L','XL','2XL','3XL','4XL'], // SanMar standard; refine per product if needed
-      imageB64: imageB64,
+      sizes: productData.sizes || ['XS','S','M','L','XL','2XL','3XL','4XL'],
+      imageB64: imgB64
+    });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════
+// SOAP HELPERS
+// ═════════════════════════════════════
+
+function buildGetProductSoap(username, password, style) {
+  return '<?xml version="1.0" encoding="UTF-8"?>'
+    + '<soapenv:Envelope'
+    + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+    + ' xmlns:ns="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/"'
+    + ' xmlns:shar="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/SharedObjects/">'
+    + '<soapenv:Header/><soapenv:Body>'
+    + '<ns:GetProductRequest>'
+    + '<shar:wsVersion>2.0.0</shar:wsVersion>'
+    + '<shar:id>' + username + '</shar:id>'
+    + '<shar:password>' + password + '</shar:password>'
+    + '<shar:localizationCountry>US</shar:localizationCountry>'
+    + '<shar:localizationLanguage>en</shar:localizationLanguage>'
+    + '<shar:productId>' + style + '</shar:productId>'
+    + '<shar:partId></shar:partId>'
+    + '<shar:colorName></shar:colorName>'
+    + '<shar:ApparelSizeArray></shar:ApparelSizeArray>'
+    + '</ns:GetProductRequest>'
+    + '</soapenv:Body></soapenv:Envelope>';
+}
+
+async function getProduct(username, password, style) {
+  var r = await fetch(PS_PRODUCT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'GetProduct' },
+    body: buildGetProductSoap(username, password, style),
+    timeout: 15000
+  });
+  var text = await r.text();
+  if (!r.ok) return { error: 'SanMar HTTP ' + r.status };
+
+  try {
+    var parsed = await xml2js.parseStringPromise(text, { explicitArray: false, ignoreAttrs: false });
+    var env  = findKey(parsed, 'Envelope') || parsed;
+    var body = findKey(env, 'Body') || {};
+
+    var fault = findKey(body, 'Fault');
+    if (fault) return { error: 'SOAP fault: ' + safeStr(fault.faultstring || fault.message || '') };
+
+    var resp = findKey(body, 'GetProductResponse') || findKey(body, 'ProductResponse');
+    if (!resp) return { error: 'No product response', rawStart: text.substring(0, 400) };
+
+    var errCode = safeStr(findKey(resp, 'errorCode') || '');
+    if (errCode && errCode !== '0') {
+      return { error: 'SanMar error ' + errCode + ': ' + safeStr(findKey(resp, 'description') || '') };
+    }
+
+    var product = findKey(resp, 'Product');
+    if (!product) return { error: 'Product ' + style + ' not found' };
+
+    var name        = safeStr(findKey(product, 'productName') || style);
+    var description = safeStr(findKey(product, 'description') || '');
+    var colors = [], sizes = [];
+
+    var partArray = findKey(product, 'ProductPartArray') || {};
+    var parts = findKey(partArray, 'ProductPart') || [];
+    if (!Array.isArray(parts)) parts = [parts];
+
+    parts.filter(Boolean).forEach(function(part) {
+      var colorArray = findKey(part, 'ColorArray') || {};
+      var colorObjs  = findKey(colorArray, 'Color') || [];
+      if (!Array.isArray(colorObjs)) colorObjs = [colorObjs];
+      colorObjs.filter(Boolean).forEach(function(c) {
+        var cn = safeStr(findKey(c, 'colorName') || c);
+        if (cn && colors.indexOf(cn) < 0) colors.push(cn);
+      });
+      var sizeObj = findKey(part, 'ApparelSize') || {};
+      var lbl     = safeStr(findKey(sizeObj, 'labelSize') || '');
+      if (lbl && sizes.indexOf(lbl) < 0) sizes.push(lbl);
     });
 
-  } catch (e) {
-    res.status(500).json({ error: 'Spec sheet fetch failed: ' + e.message });
+    return { style: style, name: name, description: description, colors: colors, sizes: sizes };
+  } catch(e) {
+    return { error: 'Parse error: ' + e.message, rawStart: text.substring(0, 400) };
   }
+}
+
+async function getPricing(username, password, customerNumber, style, color) {
+  var soap = '<?xml version="1.0" encoding="UTF-8"?>'
+    + '<soapenv:Envelope'
+    + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+    + ' xmlns:san="http://webservice.integration.sanmar.com/">'
+    + '<soapenv:Header/><soapenv:Body>'
+    + '<san:getPricing><san:arg0>'
+    + '<san:style>' + style + '</san:style>'
+    + '<san:color>' + color + '</san:color>'
+    + '<san:sizeIndex>0</san:sizeIndex>'
+    + '<san:caseQty>0</san:caseQty>'
+    + '<san:userInfo>'
+    + '<san:sanMarCustomerNumber>' + customerNumber + '</san:sanMarCustomerNumber>'
+    + '<san:sanMarUserName>' + username + '</san:sanMarUserName>'
+    + '<san:sanMarUserPassword>' + password + '</san:sanMarUserPassword>'
+    + '</san:userInfo>'
+    + '</san:arg0></san:getPricing>'
+    + '</soapenv:Body></soapenv:Envelope>';
+
+  var r = await fetch(SM_PRICING, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
+    body: soap,
+    timeout: 15000
+  });
+  var text = await r.text();
+  if (!r.ok) return { error: 'SanMar pricing HTTP ' + r.status };
+
+  try {
+    var parsed = await xml2js.parseStringPromise(text, { explicitArray: false, ignoreAttrs: false });
+    var env  = findKey(parsed, 'Envelope') || parsed;
+    var body = findKey(env, 'Body') || {};
+    var fault = findKey(body, 'Fault');
+    if (fault) return { error: 'SOAP fault: ' + safeStr(fault.faultstring || '') };
+
+    var resp = findKey(body, 'getPricingResponse') || Object.values(body)[0];
+    if (!resp) return { error: 'No pricing response' };
+
+    var ret = findKey(resp, 'return') || resp;
+    if (safeStr(findKey(ret, 'errorOccurred')) === 'true') {
+      return { error: safeStr(findKey(ret, 'message') || 'Pricing error') };
+    }
+
+    var pricing = {};
+    var sizeNames = ['XS','S','M','L','XL','2XL','3XL','4XL','5XL','6XL'];
+    var items = findKey(ret, 'responseList') || [];
+    if (!Array.isArray(items)) items = [items];
+    items.filter(Boolean).forEach(function(item, i) {
+      var price = parseFloat(safeStr(findKey(item, 'ourPriceA') || findKey(item, 'piecePrice') || 0));
+      var sz    = safeStr(findKey(item, 'size') || sizeNames[i] || '');
+      if (price > 0 && sz) pricing[sz] = price;
+    });
+
+    var c = function(s) { return pricing[s] || null; };
+    return {
+      style: style, color: color,
+      priceSXL: c('S') || c('M') || c('L') || c('XL'),
+      price2XL: c('2XL'), price3XL: c('3XL'), price4XL: c('4XL'),
+      raw: Object.keys(pricing).length > 0 ? pricing : null
+    };
+  } catch(e) {
+    return { error: 'Pricing parse error: ' + e.message };
+  }
+}
+
+async function fetchImageB64(style, color) {
+  var c = (color || '').replace(/\s+/g, '_').toUpperCase();
+  var urls = [
+    SM_IMG_BASE + style + '_' + (c || style) + '.jpg',
+    SM_IMG_BASE + style + '_' + style + '.jpg',
+    SM_IMG_BASE + style.toLowerCase() + '_' + style.toLowerCase() + '.jpg'
+  ];
+  for (var i = 0; i < urls.length; i++) {
+    try {
+      var r = await fetch(urls[i], { timeout: 7000 });
+      if (r.ok) {
+        var buf = await r.buffer();
+        if (buf.length > 1000) return buf.toString('base64');
+      }
+    } catch(e) { /* try next */ }
+  }
+  return null;
+}
+
+// Walk object finding key by suffix, ignoring namespace prefixes
+function findKey(obj, name) {
+  if (!obj || typeof obj !== 'object') return null;
+  var lower = name.toLowerCase();
+  var keys  = Object.keys(obj);
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i].toLowerCase();
+    if (k === lower || k.slice(k.lastIndexOf(':') + 1) === lower) return obj[keys[i]];
+  }
+  return null;
+}
+
+function safeStr(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'string') return val.trim();
+  if (typeof val === 'object' && val['_']) return String(val['_']).trim();
+  return '';
+}
+
+// ─────────────────────────────────────
+app.listen(PORT, function() {
+  console.log('HVP SanMar Proxy v4 running on port ' + PORT);
 });
