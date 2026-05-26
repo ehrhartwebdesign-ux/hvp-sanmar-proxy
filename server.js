@@ -123,52 +123,42 @@ app.post('/api/debug-pricing', async function(req, res) {
     var style          = (req.body.style || 'PC61').toUpperCase();
     var color          = req.body.color || 'White';
     if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
-    // Try multiple variations to find what SanMar accepts
-    var results = {};
-    var variations = [
-      { sizeIndex: '1', caseQty: '0', color: color },
-      { sizeIndex: '0', caseQty: '0', color: color },
-      { sizeIndex: '1', caseQty: '1', color: color },
-      { sizeIndex: '1', caseQty: '0', color: '' },
-    ];
-    for (var vi = 0; vi < variations.length; vi++) {
-      var v = variations[vi];
-      var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-        + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://impl.webservice.integration.sanmar.com/">'
-        + '<soapenv:Header/><soapenv:Body>'
-        + '<san:getPricing><san:arg0>'
-        + '<san:style>' + style + '</san:style>'
-        + '<san:color>' + v.color + '</san:color>'
-        + '<san:sizeIndex>' + v.sizeIndex + '</san:sizeIndex>'
-        + '<san:caseQty>' + v.caseQty + '</san:caseQty>'
-        + '<san:userInfo>'
-        + '<san:sanMarCustomerNumber>' + customerNumber + '</san:sanMarCustomerNumber>'
-        + '<san:sanMarUserName>' + username + '</san:sanMarUserName>'
-        + '<san:sanMarUserPassword>' + password + '</san:sanMarUserPassword>'
-        + '</san:userInfo>'
-        + '</san:arg0></san:getPricing>'
-        + '</soapenv:Body></soapenv:Envelope>';
-      try {
-        var r = await fetch(SM_PRICING, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
-          body: soap,
-          timeout: 15000
-        });
-        var text = await r.text();
-        var key = 'variation_' + (vi+1) + '_sizeIdx' + v.sizeIndex + '_caseQty' + v.caseQty + '_color_' + (v.color||'empty');
-        results[key] = { httpStatus: r.status, rawXml: text.substring(0, 1500) };
-        if (r.ok && !text.includes('NullPointer') && !text.includes('Fault')) break;
-      } catch(e) {
-        results['variation_' + (vi+1)] = { error: e.message };
-      }
-    }
-    res.json(results);
+
+    // Use correct two-arg structure per official docs
+    var soap = '<?xml version="1.0" encoding="UTF-8"?>'
+      + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:impl="http://impl.webservice.integration.sanmar.com/">'
+      + '<soapenv:Header/><soapenv:Body>'
+      + '<impl:getPricing>'
+      + '<arg0>'
+      + '<color>' + color + '</color>'
+      + '<size>XL</size>'
+      + '<style>' + style + '</style>'
+      + '<sizeIndex></sizeIndex>'
+      + '<casePrice></casePrice><dozenPrice></dozenPrice><inventoryKey></inventoryKey>'
+      + '<myPrice></myPrice><piecePrice></piecePrice><salePrice></salePrice>'
+      + '<saleStartDate></saleStartDate><saleEndDate></saleEndDate><incentivePrice></incentivePrice>'
+      + '</arg0>'
+      + '<arg1>'
+      + '<sanMarCustomerNumber>' + customerNumber + '</sanMarCustomerNumber>'
+      + '<sanMarUserName>' + username + '</sanMarUserName>'
+      + '<sanMarUserPassword>' + password + '</sanMarUserPassword>'
+      + '<senderId></senderId><senderPassword></senderPassword>'
+      + '</arg1>'
+      + '</impl:getPricing>'
+      + '</soapenv:Body></soapenv:Envelope>';
+
+    var r = await fetch(SM_PRICING, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
+      body: soap,
+      timeout: 15000
+    });
+    var text = await r.text();
+    res.json({ httpStatus: r.status, httpOk: r.ok, rawXml: text.substring(0, 4000), style: style, color: color, customerNumber: customerNumber ? '***set***' : 'MISSING' });
   } catch(e) {
     res.json({ error: e.message });
   }
 });
-
 app.post('/api/debug', async function(req, res) {
   try {
     var username = req.body.username;
@@ -429,90 +419,120 @@ async function getProduct(username, password, style) {
 
 
 async function getPricing(username, password, customerNumber, style, color) {
-  var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-    + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://impl.webservice.integration.sanmar.com/">'
-    + '<soapenv:Header/><soapenv:Body>'
-    + '<san:getPricing><san:arg0>'
-    + '<san:style>' + style + '</san:style>'
-    + '<san:color>' + color + '</san:color>'
-    + '<san:sizeIndex>1</san:sizeIndex>'
-    + '<san:caseQty>0</san:caseQty>'
-    + '<san:userInfo>'
-    + '<san:sanMarCustomerNumber>' + customerNumber + '</san:sanMarCustomerNumber>'
-    + '<san:sanMarUserName>' + username + '</san:sanMarUserName>'
-    + '<san:sanMarUserPassword>' + password + '</san:sanMarUserPassword>'
-    + '</san:userInfo>'
-    + '</san:arg0></san:getPricing>'
-    + '</soapenv:Body></soapenv:Envelope>';
+  // Correct structure per SanMar Web Services Integration Guide v18.4+
+  // arg0 = product fields, arg1 = credentials (two separate args)
+  // Fetch pricing for all standard sizes in one pass
+  var sizes = ['XS','S','M','L','XL','2XL','3XL','4XL'];
+  var pricing = {};
+  var firstError = null;
 
-  var r = await fetch(SM_PRICING, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
-    body: soap,
-    timeout: 15000
-  });
-  var text = await r.text();
-  if (!r.ok) return { error: 'SanMar pricing HTTP ' + r.status, rawStart: text.substring(0, 400) };
+  // Fetch a few key sizes (S, XL, 2XL, 3XL, 4XL) to get the price tiers
+  var sizesToFetch = ['S','XL','2XL','3XL','4XL'];
+  for (var si = 0; si < sizesToFetch.length; si++) {
+    var sz = sizesToFetch[si];
+    try {
+      var soap = '<?xml version="1.0" encoding="UTF-8"?>'
+        + '<soapenv:Envelope'
+        + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+        + ' xmlns:impl="http://impl.webservice.integration.sanmar.com/">'
+        + '<soapenv:Header/><soapenv:Body>'
+        + '<impl:getPricing>'
+        + '<arg0>'
+        + '<color>' + (color || '') + '</color>'
+        + '<size>' + sz + '</size>'
+        + '<style>' + style + '</style>'
+        + '<sizeIndex></sizeIndex>'
+        + '<casePrice></casePrice>'
+        + '<dozenPrice></dozenPrice>'
+        + '<inventoryKey></inventoryKey>'
+        + '<myPrice></myPrice>'
+        + '<piecePrice></piecePrice>'
+        + '<salePrice></salePrice>'
+        + '<saleStartDate></saleStartDate>'
+        + '<saleEndDate></saleEndDate>'
+        + '<incentivePrice></incentivePrice>'
+        + '</arg0>'
+        + '<arg1>'
+        + '<sanMarCustomerNumber>' + customerNumber + '</sanMarCustomerNumber>'
+        + '<sanMarUserName>' + username + '</sanMarUserName>'
+        + '<sanMarUserPassword>' + password + '</sanMarUserPassword>'
+        + '<senderId></senderId>'
+        + '<senderPassword></senderPassword>'
+        + '</arg1>'
+        + '</impl:getPricing>'
+        + '</soapenv:Body></soapenv:Envelope>';
 
-  try {
-    var parsed = await xml2js.parseStringPromise(text, { explicitArray: true, ignoreAttrs: true });
-    var env  = findKey(parsed, 'Envelope') || parsed;
-    var body = findKey(env,    'Body')     || {};
+      var r = await fetch(SM_PRICING, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
+        body: soap,
+        timeout: 12000
+      });
+      var text = await r.text();
 
-    var fault = findKey(body, 'Fault');
-    if (fault) {
-      var fArr = Array.isArray(fault) ? fault : [fault];
-      return { error: 'SOAP fault: ' + arrVal(fArr[0], 'faultstring') };
+      if (!r.ok) {
+        firstError = firstError || ('HTTP ' + r.status);
+        continue;
+      }
+
+      var parsed = await xml2js.parseStringPromise(text, { explicitArray: true, ignoreAttrs: true });
+      var env  = findKey(parsed, 'Envelope') || parsed;
+      var body = findKey(env, 'Body') || {};
+
+      var fault = findKey(body, 'Fault');
+      if (fault) {
+        var fa = Array.isArray(fault) ? fault : [fault];
+        firstError = firstError || ('SOAP fault: ' + arrVal(fa[0], 'faultstring'));
+        continue;
+      }
+
+      // Response structure: <ns2:getPricingResponse><return><listResponse>...</listResponse></return></ns2:getPricingResponse>
+      var resp = findKey(body, 'getPricingResponse');
+      if (!resp) { firstError = firstError || 'No getPricingResponse'; continue; }
+      var respObj = Array.isArray(resp) ? resp[0] : resp;
+
+      var retArr = findKey(respObj, 'return');
+      if (!retArr) { firstError = firstError || 'No return element'; continue; }
+      var ret = Array.isArray(retArr) ? retArr[0] : retArr;
+
+      var errOccurred = arrVal(ret, 'errorOccurred');
+      if (errOccurred === 'true') {
+        firstError = firstError || (arrVal(ret, 'message') || 'Pricing error');
+        continue;
+      }
+
+      // Get price from listResponse - it may contain multiple items (one per size/color)
+      var listRaw = findKey(ret, 'listResponse');
+      if (!listRaw) continue;
+      var items = Array.isArray(listRaw) ? listRaw : [listRaw];
+
+      items.filter(Boolean).forEach(function(item) {
+        // myPrice = your dealer price, piecePrice = standard piece price
+        var price = parseFloat(arrVal(item, 'myPrice') || arrVal(item, 'piecePrice') || '0');
+        var itemSize = arrVal(item, 'size') || sz;
+        if (price > 0) pricing[itemSize] = price;
+      });
+
+    } catch(e) {
+      firstError = firstError || e.message;
     }
-
-    // SanMar pricing response: <ns2:getPricingResponse><return>...</return></ns2:getPricingResponse>
-    var resp = findKey(body, 'getPricingResponse');
-    if (!resp) return { error: 'No pricing response', rawStart: text.substring(0, 400) };
-    var respObj = Array.isArray(resp) ? resp[0] : resp;
-
-    var retArr = findKey(respObj, 'return');
-    if (!retArr) return { error: 'No return element in pricing response', rawStart: text.substring(0, 400) };
-    var ret = Array.isArray(retArr) ? retArr[0] : retArr;
-
-    // Check for error
-    var errOccurred = arrVal(ret, 'errorOccurred');
-    if (errOccurred === 'true') {
-      return { error: arrVal(ret, 'message') || 'Pricing error from SanMar' };
-    }
-
-    // Build size->price map from responseList array
-    var pricing = {};
-    var sizeNames = ['XS','S','M','L','XL','2XL','3XL','4XL','5XL','6XL'];
-    var listRaw = findKey(ret, 'responseList') || [];
-    var items = Array.isArray(listRaw) ? listRaw : [listRaw];
-
-    items.filter(Boolean).forEach(function(item, i) {
-      // Try multiple possible price field names
-      var price = parseFloat(
-        arrVal(item, 'ourPriceA') ||
-        arrVal(item, 'piecePrice') ||
-        arrVal(item, 'salePrice') ||
-        '0'
-      );
-      var sz = arrVal(item, 'size') || sizeNames[i] || '';
-      if (price > 0 && sz) pricing[sz] = price;
-    });
-
-    // Convenience fields
-    function p(s) { return pricing[s] || null; }
-    var sxl = p('S') || p('M') || p('L') || p('XL') || null;
-
-    return {
-      style: style, color: color,
-      priceSXL: sxl,
-      price2XL: p('2XL'),
-      price3XL: p('3XL'),
-      price4XL: p('4XL'),
-      raw: Object.keys(pricing).length > 0 ? pricing : null
-    };
-  } catch(e) {
-    return { error: 'Pricing parse error: ' + e.message, rawStart: text.substring(0, 400) };
   }
+
+  if (Object.keys(pricing).length === 0) {
+    return { error: firstError || 'No pricing data returned', style: style, color: color };
+  }
+
+  function p(s) { return pricing[s] || null; }
+  var sxl = p('S') || p('M') || p('L') || p('XL') || null;
+
+  return {
+    style: style, color: color,
+    priceSXL: sxl,
+    price2XL: p('2XL'),
+    price3XL: p('3XL'),
+    price4XL: p('4XL'),
+    raw: pricing
+  };
 }
 
 
