@@ -124,7 +124,7 @@ app.post('/api/debug-pricing', async function(req, res) {
     var color          = req.body.color || 'White';
     if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
     var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-      + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://webservice.integration.sanmar.com/">'
+      + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://impl.webservice.integration.sanmar.com/">'
       + '<soapenv:Header/><soapenv:Body>'
       + '<san:getPricing><san:arg0>'
       + '<san:style>' + style + '</san:style>'
@@ -401,7 +401,7 @@ async function getProduct(username, password, style) {
 
 async function getPricing(username, password, customerNumber, style, color) {
   var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-    + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://webservice.integration.sanmar.com/">'
+    + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:san="http://impl.webservice.integration.sanmar.com/">'
     + '<soapenv:Header/><soapenv:Body>'
     + '<san:getPricing><san:arg0>'
     + '<san:style>' + style + '</san:style>'
