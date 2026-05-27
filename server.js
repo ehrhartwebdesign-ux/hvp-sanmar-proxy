@@ -1,609 +1,93 @@
-/**
- * HVP SanMar Proxy Server v4
- * Per SanMar Web Services Integration Guide v24.3
- *
- * CREDENTIAL NOTES:
- * - This proxy uses your sanmar.com USERNAME + PASSWORD (web services)
- * - FTP credentials are DIFFERENT - not used here
- * - Web services must be enabled: email sanmarintegrations@sanmar.com
- */
-
 'use strict';
+const express    = require('express');
+const nodemailer = require('nodemailer');
+const db         = require('../db');
+const { requireAuth } = require('../middleware/auth');
+const router     = express.Router();
 
-const express = require('express');
-const cors    = require('cors');
-const fetch   = require('node-fetch');
-const xml2js  = require('xml2js');
-
-const app  = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(cors());
-app.use(express.json());
-
-// Always return JSON, never crash the process
-process.on('unhandledRejection', function(reason) {
-  console.error('Unhandled rejection:', reason);
-});
-process.on('uncaughtException', function(err) {
-  console.error('Uncaught exception:', err);
-});
-
-// ── SanMar endpoints ──
-const PS_PRODUCT  = 'https://ws.sanmar.com:8080/promostandards/ProductDataServiceBindingV2';
-const SM_PRICING  = 'https://ws.sanmar.com:8080/SanMarWebService/SanMarPricingServicePort';
-const SM_IMG_BASE = 'https://cdnl.sanmar.com/catalog/images/imglib/mresjpg/';
-
-// ─────────────────────────────────────
-// HEALTH / PING
-// ─────────────────────────────────────
-app.get('/', function(req, res) {
-  res.json({ status: 'ok', service: 'HVP SanMar Proxy', version: '4.0.0' });
-});
-
-// Render free tier keep-alive ping
-app.get('/ping', function(req, res) {
-  res.json({ pong: true, time: new Date().toISOString() });
-});
-
-// ─────────────────────────────────────
-// TEST CREDENTIALS
-// POST { username, password }
-// ─────────────────────────────────────
-app.post('/api/test', async function(req, res) {
+// POST /api/email/send
+// Body: { quote_id, from_email, from_password, to_email, subject, body_html, pdf_b64, pdf_filename }
+router.post('/send', requireAuth, async function(req, res) {
   try {
-    var username = req.body.username;
-    var password = req.body.password;
-
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Missing username or password' });
+    const { quote_id, from_email, from_password, to_email, subject, body_html, pdf_b64, pdf_filename } = req.body;
+    if (!from_email || !from_password || !to_email) {
+      return res.status(400).json({ error: 'from_email, from_password, and to_email required' });
     }
 
-    var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-      + '<soapenv:Envelope'
-      + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
-      + ' xmlns:ns="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/"'
-      + ' xmlns:shar="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/SharedObjects/">'
-      + '<soapenv:Header/><soapenv:Body>'
-      + '<ns:GetProductSellableRequest>'
-      + '<shar:wsVersion>2.0.0</shar:wsVersion>'
-      + '<shar:id>' + username + '</shar:id>'
-      + '<shar:password>' + password + '</shar:password>'
-      + '<shar:productId>PC61</shar:productId>'
-      + '<shar:isSellable>true</shar:isSellable>'
-      + '</ns:GetProductSellableRequest>'
-      + '</soapenv:Body></soapenv:Envelope>';
-
-    var r = await fetch(PS_PRODUCT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'GetProductSellable' },
-      body: soap,
-      timeout: 15000
+    // Create Outlook/Office365 SMTP transporter using employee's own credentials
+    var transporter = nodemailer.createTransport({
+      host: 'smtp.office365.com',
+      port: 587,
+      secure: false,
+      auth: { user: from_email, pass: from_password },
+      tls: { ciphers: 'SSLv3', rejectUnauthorized: false }
     });
 
-    var text = await r.text();
-    var lower = text.toLowerCase();
+    var mailOptions = {
+      from: from_email,
+      to: to_email,
+      subject: subject || 'Your Quote from Hudson Valley Promos',
+      html: body_html || '<p>Please find your quote attached.</p>',
+    };
 
-    if (r.status === 403) {
-      return res.json({ error: 'HTTP 403 from SanMar. Your account may not have web services enabled yet. Email sanmarintegrations@sanmar.com with your customer number to request access.' });
-    }
-    if (r.status === 401) {
-      return res.json({ error: 'HTTP 401 - Invalid credentials. Use your sanmar.com username and password (not FTP credentials).' });
-    }
-    if (!r.ok) {
-      return res.json({ error: 'SanMar returned HTTP ' + r.status, rawStart: text.substring(0, 300) });
-    }
-    if (lower.includes('errorcode>105') || lower.includes('errorcode>100') || (lower.includes('authentication') && lower.includes('fail'))) {
-      return res.json({ error: 'Authentication failed. Check your sanmar.com username and password. Note: web services must be separately enabled by emailing sanmarintegrations@sanmar.com.' });
-    }
-    if (lower.includes('errorcode>104') || lower.includes('unauthorized')) {
-      return res.json({ error: 'Account not authorized for web services. Email sanmarintegrations@sanmar.com to enable access (1-2 business days).' });
-    }
-    if (lower.includes('fault')) {
-      var fm = text.match(/<faultstring[^>]*>([^<]+)<\/faultstring>/i);
-      return res.json({ error: 'SOAP fault: ' + (fm ? fm[1] : 'unknown'), rawStart: text.substring(0, 300) });
+    if (pdf_b64) {
+      mailOptions.attachments = [{
+        filename: pdf_filename || 'HVP_Quote.pdf',
+        content: pdf_b64,
+        encoding: 'base64',
+        contentType: 'application/pdf'
+      }];
     }
 
-    res.json({ ok: true, message: 'Connected to SanMar. Credentials valid.' });
+    await transporter.sendMail(mailOptions);
 
+    // Log it
+    if (quote_id) {
+      await db.query(
+        'INSERT INTO email_log (quote_id,sent_by,recipient,subject,success) VALUES ($1,$2,$3,$4,true)',
+        [quote_id, req.employee.id, to_email, subject]
+      );
+      await db.query(
+        'UPDATE quotes SET emailed_at=NOW(), status=CASE WHEN status=\'draft\' THEN \'sent\' ELSE status END WHERE id=$1',
+        [quote_id]
+      );
+    }
+
+    res.json({ ok: true, message: 'Email sent from ' + from_email });
   } catch(e) {
-    res.json({ error: 'Proxy error: ' + e.message });
+    // Log failure
+    if (req.body.quote_id) {
+      await db.query(
+        'INSERT INTO email_log (quote_id,sent_by,recipient,subject,success,error_msg) VALUES ($1,$2,$3,$4,false,$5)',
+        [req.body.quote_id, req.employee.id, req.body.to_email, req.body.subject, e.message]
+      ).catch(function(){});
+    }
+    var hint = '';
+    if (e.message.includes('535') || e.message.includes('auth')) {
+      hint = ' Your Outlook password may be wrong, or you may need to use an App Password if MFA is enabled.';
+    }
+    res.status(500).json({ error: e.message + hint });
   }
 });
 
-// ─────────────────────────────────────
-// DEBUG — raw SOAP response
-// POST { username, password, style }
-// ─────────────────────────────────────
-app.post('/api/debug-pricing', async function(req, res) {
+// GET /api/email/test-smtp — verify SMTP credentials without sending
+router.post('/test-smtp', requireAuth, async function(req, res) {
   try {
-    var username       = req.body.username;
-    var password       = req.body.password;
-    var customerNumber = req.body.customerNumber || '';
-    var style          = (req.body.style || 'PC61').toUpperCase();
-    var color          = req.body.color || 'White';
-    if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
-
-    // Use correct two-arg structure per official docs
-    var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-      + '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:impl="http://impl.webservice.integration.sanmar.com/">'
-      + '<soapenv:Header/><soapenv:Body>'
-      + '<impl:getPricing>'
-      + '<arg0>'
-      + '<color>' + color + '</color>'
-      + '<size>XL</size>'
-      + '<style>' + style + '</style>'
-      + '<sizeIndex></sizeIndex>'
-      + '<casePrice></casePrice><dozenPrice></dozenPrice><inventoryKey></inventoryKey>'
-      + '<myPrice></myPrice><piecePrice></piecePrice><salePrice></salePrice>'
-      + '<saleStartDate></saleStartDate><saleEndDate></saleEndDate><incentivePrice></incentivePrice>'
-      + '</arg0>'
-      + '<arg1>'
-      + '<sanMarCustomerNumber>' + customerNumber + '</sanMarCustomerNumber>'
-      + '<sanMarUserName>' + username + '</sanMarUserName>'
-      + '<sanMarUserPassword>' + password + '</sanMarUserPassword>'
-      + '<senderId></senderId><senderPassword></senderPassword>'
-      + '</arg1>'
-      + '</impl:getPricing>'
-      + '</soapenv:Body></soapenv:Envelope>';
-
-    var r = await fetch(SM_PRICING, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
-      body: soap,
-      timeout: 15000
+    const { from_email, from_password } = req.body;
+    var transporter = nodemailer.createTransport({
+      host: 'smtp.office365.com', port: 587, secure: false,
+      auth: { user: from_email, pass: from_password },
+      tls: { ciphers: 'SSLv3', rejectUnauthorized: false }
     });
-    var text = await r.text();
-    res.json({ httpStatus: r.status, httpOk: r.ok, rawXml: text.substring(0, 4000), style: style, color: color, customerNumber: customerNumber ? '***set***' : 'MISSING' });
+    await transporter.verify();
+    res.json({ ok: true, message: 'Outlook SMTP credentials valid.' });
   } catch(e) {
-    res.json({ error: e.message });
-  }
-});
-app.post('/api/debug', async function(req, res) {
-  try {
-    var username = req.body.username;
-    var password = req.body.password;
-    var style    = (req.body.style || 'PC61').toUpperCase();
-
-    if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
-
-    var soap = buildGetProductSoap(username, password, style);
-    var r = await fetch(PS_PRODUCT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'GetProduct' },
-      body: soap,
-      timeout: 15000
-    });
-    var text = await r.text();
-    res.json({
-      httpStatus: r.status,
-      httpOk: r.ok,
-      rawXml: text.substring(0, 3000),
-      hasError: text.toLowerCase().includes('fault') || text.toLowerCase().includes('error'),
-      hasProduct: text.toLowerCase().includes('product')
-    });
-  } catch(e) {
-    res.json({ error: e.message });
-  }
-});
-
-// ─────────────────────────────────────
-// PRODUCT LOOKUP
-// POST { username, password, style }
-// ─────────────────────────────────────
-app.post('/api/product', async function(req, res) {
-  try {
-    var username = req.body.username;
-    var password = req.body.password;
-    var style    = (req.body.style || '').toUpperCase();
-    if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
-    var data = await getProduct(username, password, style);
-    // Safely serialize - strip any non-JSON-safe values
-    var safe = JSON.parse(JSON.stringify(data, function(k, v) {
-      if (v === undefined || typeof v === 'function') return null;
-      return v;
-    }));
-    res.json(safe);
-  } catch(e) {
-    console.error('Product route error:', e);
-    res.status(500).json({ error: e.message, stack: e.stack ? e.stack.split('\n').slice(0,3).join(' | ') : '' });
-  }
-});
-
-// ─────────────────────────────────────
-// PRICING LOOKUP
-// POST { username, password, customerNumber, style, color }
-// ─────────────────────────────────────
-app.post('/api/pricing', async function(req, res) {
-  try {
-    var username       = req.body.username;
-    var password       = req.body.password;
-    var customerNumber = req.body.customerNumber;
-    var style          = (req.body.style || '').toUpperCase();
-    var color          = req.body.color || '';
-
-    if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
-    if (!customerNumber) return res.status(400).json({ error: 'Customer number required for pricing. Add it in Settings.' });
-
-    var data = await getPricing(username, password, customerNumber, style, color);
-    var safe = JSON.parse(JSON.stringify(data, function(k, v) {
-      if (v === undefined || typeof v === 'function') return null;
-      return v;
-    }));
-    res.json(safe);
-  } catch(e) {
-    console.error('Pricing route error:', e);
-    res.status(500).json({ error: e.message, stack: e.stack ? e.stack.split('\n').slice(0,3).join(' | ') : '' });
-  }
-});
-
-// ─────────────────────────────────────
-// IMAGE PROXY
-// GET /api/image/:style?color=Navy
-// ─────────────────────────────────────
-app.get('/api/image/:style', async function(req, res) {
-  try {
-    var style = req.params.style.toUpperCase();
-    var color = (req.query.color || '').replace(/\s+/g, '_').toUpperCase();
-    // Build color-specific URL variants
-    var colorCode = (color || '').toUpperCase().replace(/\s+/g, '_').replace(/[^A-Z0-9_]/g, '');
-    var colorCode2 = (color || '').toUpperCase().replace(/\s+/g, '-').replace(/[^A-Z0-9-]/g, '');
-    var colorShort = (color || '').toUpperCase().replace(/\s+/g, '').substring(0, 8);
-    var urls = [
-      SM_IMG_BASE + style + '_' + colorCode + '.jpg',
-      SM_IMG_BASE + style + '_' + colorCode2 + '.jpg',
-      SM_IMG_BASE + style + '_' + colorShort + '.jpg',
-      SM_IMG_BASE + style + '_' + style + '.jpg',
-      SM_IMG_BASE + style.toLowerCase() + '_' + style.toLowerCase() + '.jpg'
-    ].filter(function(u,i,a){ return a.indexOf(u)===i; }); // dedupe
-    for (var i = 0; i < urls.length; i++) {
-      try {
-        var r = await fetch(urls[i], { timeout: 8000 });
-        if (r.ok) {
-          var buf = await r.buffer();
-          if (buf.length > 1000) {
-            return res.json({ style: style, imageUrl: urls[i], imageB64: buf.toString('base64'), mimeType: 'image/jpeg' });
-          }
-        }
-      } catch(e) { /* try next */ }
+    var hint = '';
+    if (e.message.includes('535') || e.message.includes('auth')) {
+      hint = ' If MFA is enabled on your account, you need to create an App Password in Microsoft account security settings and use that instead of your regular password.';
     }
-    res.status(404).json({ error: 'Image not found for ' + style });
-  } catch(e) {
-    res.json({ error: e.message });
+    res.json({ ok: false, error: e.message + hint });
   }
 });
 
-// ─────────────────────────────────────
-// SPEC SHEET
-// POST { username, password, style }
-// ─────────────────────────────────────
-app.post('/api/specsheet', async function(req, res) {
-  try {
-    var username = req.body.username;
-    var password = req.body.password;
-    var style    = (req.body.style || '').toUpperCase();
-    if (!username || !password || !style) return res.status(400).json({ error: 'Missing fields' });
-
-    var results = await Promise.all([
-      getProduct(username, password, style),
-      fetchImageB64(style, '')
-    ]);
-    var productData = results[0];
-    var imgB64      = results[1];
-
-    if (productData.error) return res.status(404).json(productData);
-
-    var desc = productData.description || '';
-    var wm   = desc.match(/(\d+(?:\.\d+)?\s*(?:oz|g\/m2|gsm)[^,.\n]*)/i);
-    var fm   = desc.match(/(\d+%[^.\n]{3,60}(?:cotton|polyester|fleece|blend|jersey|pique|spandex)[^.\n]*)/i);
-    var feats = desc.split(/[.\n]/).map(function(s){ return s.trim(); }).filter(function(s){ return s.length > 10 && s.length < 140; });
-
-    // Use SanMar's own bullets if available, else parse from description
-    var bullets = productData.bullets && productData.bullets.length > 1
-      ? productData.bullets
-      : feats.slice(0, 8);
-
-    res.json({
-      style: style,
-      name: productData.name,
-      description: desc,
-      bullets: bullets,
-      fabric: fm ? fm[1].trim() : null,
-      weight: wm ? wm[1].trim() : null,
-      features: bullets,
-      colors: productData.colors || [],
-      sizes: productData.sizes || ['XS','S','M','L','XL','2XL','3XL','4XL'],
-      imageB64: imgB64
-    });
-  } catch(e) {
-    res.json({ error: e.message });
-  }
-});
-
-// ═════════════════════════════════════
-// SOAP HELPERS
-// ═════════════════════════════════════
-
-function buildGetProductSoap(username, password, style) {
-  return '<?xml version="1.0" encoding="UTF-8"?>'
-    + '<soapenv:Envelope'
-    + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
-    + ' xmlns:ns="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/"'
-    + ' xmlns:shar="http://www.promostandards.org/WSDL/ProductDataService/2.0.0/SharedObjects/">'
-    + '<soapenv:Header/><soapenv:Body>'
-    + '<ns:GetProductRequest>'
-    + '<shar:wsVersion>2.0.0</shar:wsVersion>'
-    + '<shar:id>' + username + '</shar:id>'
-    + '<shar:password>' + password + '</shar:password>'
-    + '<shar:localizationCountry>US</shar:localizationCountry>'
-    + '<shar:localizationLanguage>en</shar:localizationLanguage>'
-    + '<shar:productId>' + style + '</shar:productId>'
-    + '</ns:GetProductRequest>'
-    + '</soapenv:Body></soapenv:Envelope>';
-}
-
-async function getProduct(username, password, style) {
-  var r = await fetch(PS_PRODUCT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'GetProduct' },
-    body: buildGetProductSoap(username, password, style),
-    timeout: 15000
-  });
-  var text = await r.text();
-  if (!r.ok) return { error: 'SanMar HTTP ' + r.status };
-
-  try {
-    // Parse with explicitArray:true so we always get arrays — no type-checking needed
-    var parsed = await xml2js.parseStringPromise(text, { explicitArray: true, ignoreAttrs: true });
-
-    // Walk envelope: keys keep their XML source prefix (S:, ns2:, or none for default ns)
-    var env  = findKey(parsed,  'Envelope') || parsed;
-    var body = findKey(env,     'Body')     || {};
-
-    // Check for SOAP fault
-    var fault = findKey(body, 'Fault');
-    if (fault) {
-      var faultArr = Array.isArray(fault) ? fault : [fault];
-      var fs = arrVal(faultArr[0], 'faultstring');
-      return { error: 'SOAP fault: ' + fs };
-    }
-
-    var resp = findKey(body, 'GetProductResponse');
-    if (!resp) return { error: 'No GetProductResponse in reply', rawStart: text.substring(0, 400) };
-    var respObj = Array.isArray(resp) ? resp[0] : resp;
-
-    // PromoStandards error check
-    var ec = arrVal(respObj, 'errorCode');
-    if (ec && ec !== '0') {
-      return { error: 'SanMar error ' + ec + ': ' + arrVal(respObj, 'description') };
-    }
-
-    var productArr = findKey(respObj, 'Product');
-    if (!productArr) return { error: 'Product ' + style + ' not found' };
-    var product = Array.isArray(productArr) ? productArr[0] : productArr;
-
-    // productName is a single tag -> ['Port & Co...'] with explicitArray:true
-    var name = arrVal(product, 'productName') || style;
-
-    // description is MULTIPLE tags -> keep as array for bullet points
-    var descRaw = findKey(product, 'description') || [];
-    var descArr = Array.isArray(descRaw) ? descRaw : [descRaw];
-    var bullets = descArr.map(function(d) {
-      return typeof d === 'string' ? d.trim() : (d && d['_'] ? d['_'].trim() : '');
-    }).filter(function(d){ return d.length > 2; });
-    // Also join for backwards compat
-    var description = bullets.join(' ');
-
-    // Colors and sizes from ProductPartArray
-    var colors = [], sizes = [];
-    var partArrayRaw = findKey(product, 'ProductPartArray');
-    if (partArrayRaw) {
-      var partArrayObj = Array.isArray(partArrayRaw) ? partArrayRaw[0] : partArrayRaw;
-      var partsRaw = findKey(partArrayObj, 'ProductPart') || [];
-      var parts = Array.isArray(partsRaw) ? partsRaw : [partsRaw];
-
-      parts.filter(Boolean).forEach(function(part) {
-        // Colors
-        var colorArrayRaw = findKey(part, 'ColorArray');
-        if (colorArrayRaw) {
-          var colorArrayObj = Array.isArray(colorArrayRaw) ? colorArrayRaw[0] : colorArrayRaw;
-          var colorObjs = findKey(colorArrayObj, 'Color') || [];
-          if (!Array.isArray(colorObjs)) colorObjs = [colorObjs];
-          colorObjs.filter(Boolean).forEach(function(c) {
-            var cn = arrVal(c, 'colorName');
-            if (cn && colors.indexOf(cn) < 0) colors.push(cn);
-          });
-        }
-        // Sizes
-        var sizeRaw = findKey(part, 'ApparelSize');
-        if (sizeRaw) {
-          var sizeObj = Array.isArray(sizeRaw) ? sizeRaw[0] : sizeRaw;
-          var lbl = arrVal(sizeObj, 'labelSize');
-          if (lbl && sizes.indexOf(lbl) < 0) sizes.push(lbl);
-        }
-      });
-    }
-
-    return { style: style, name: name, description: description, bullets: bullets, colors: colors, sizes: sizes };
-
-  } catch(e) {
-    return { error: 'Parse error: ' + e.message + ' at: ' + (e.stack||'').split('\n')[1], rawStart: text.substring(0, 600) };
-  }
-}
-
-
-async function getPricing(username, password, customerNumber, style, color) {
-  // Correct structure per SanMar Web Services Integration Guide v18.4+
-  // arg0 = product fields, arg1 = credentials (two separate args)
-  // Fetch pricing for all standard sizes in one pass
-  var sizes = ['XS','S','M','L','XL','2XL','3XL','4XL'];
-  var pricing = {};
-  var firstError = null;
-
-  // Fetch a few key sizes (S, XL, 2XL, 3XL, 4XL) to get the price tiers
-  var sizesToFetch = ['S','XL','2XL','3XL','4XL'];
-  for (var si = 0; si < sizesToFetch.length; si++) {
-    var sz = sizesToFetch[si];
-    try {
-      var soap = '<?xml version="1.0" encoding="UTF-8"?>'
-        + '<soapenv:Envelope'
-        + ' xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
-        + ' xmlns:impl="http://impl.webservice.integration.sanmar.com/">'
-        + '<soapenv:Header/><soapenv:Body>'
-        + '<impl:getPricing>'
-        + '<arg0>'
-        + '<color>' + (color || '') + '</color>'
-        + '<size>' + sz + '</size>'
-        + '<style>' + style + '</style>'
-        + '<sizeIndex></sizeIndex>'
-        + '<casePrice></casePrice>'
-        + '<dozenPrice></dozenPrice>'
-        + '<inventoryKey></inventoryKey>'
-        + '<myPrice></myPrice>'
-        + '<piecePrice></piecePrice>'
-        + '<salePrice></salePrice>'
-        + '<saleStartDate></saleStartDate>'
-        + '<saleEndDate></saleEndDate>'
-        + '<incentivePrice></incentivePrice>'
-        + '</arg0>'
-        + '<arg1>'
-        + '<sanMarCustomerNumber>' + customerNumber + '</sanMarCustomerNumber>'
-        + '<sanMarUserName>' + username + '</sanMarUserName>'
-        + '<sanMarUserPassword>' + password + '</sanMarUserPassword>'
-        + '<senderId></senderId>'
-        + '<senderPassword></senderPassword>'
-        + '</arg1>'
-        + '</impl:getPricing>'
-        + '</soapenv:Body></soapenv:Envelope>';
-
-      var r = await fetch(SM_PRICING, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'getPricing' },
-        body: soap,
-        timeout: 12000
-      });
-      var text = await r.text();
-
-      if (!r.ok) {
-        firstError = firstError || ('HTTP ' + r.status);
-        continue;
-      }
-
-      var parsed = await xml2js.parseStringPromise(text, { explicitArray: true, ignoreAttrs: true });
-      var env  = findKey(parsed, 'Envelope') || parsed;
-      var body = findKey(env, 'Body') || {};
-
-      var fault = findKey(body, 'Fault');
-      if (fault) {
-        var fa = Array.isArray(fault) ? fault : [fault];
-        firstError = firstError || ('SOAP fault: ' + arrVal(fa[0], 'faultstring'));
-        continue;
-      }
-
-      // Response structure: <ns2:getPricingResponse><return><listResponse>...</listResponse></return></ns2:getPricingResponse>
-      var resp = findKey(body, 'getPricingResponse');
-      if (!resp) { firstError = firstError || 'No getPricingResponse'; continue; }
-      var respObj = Array.isArray(resp) ? resp[0] : resp;
-
-      var retArr = findKey(respObj, 'return');
-      if (!retArr) { firstError = firstError || 'No return element'; continue; }
-      var ret = Array.isArray(retArr) ? retArr[0] : retArr;
-
-      var errOccurred = arrVal(ret, 'errorOccurred');
-      if (errOccurred === 'true') {
-        firstError = firstError || (arrVal(ret, 'message') || 'Pricing error');
-        continue;
-      }
-
-      // listResponse = single item per call (one size queried at a time)
-      // myPrice = your dealer/account rate, piecePrice = standard retail price
-      var listRaw = findKey(ret, 'listResponse');
-      if (!listRaw) continue;
-      var items = Array.isArray(listRaw) ? listRaw : [listRaw];
-      items.filter(Boolean).forEach(function(item) {
-        var myP    = parseFloat(arrVal(item, 'myPrice')    || '0');
-        var pieceP = parseFloat(arrVal(item, 'piecePrice') || '0');
-        var price  = myP > 0 ? myP : pieceP;
-        var itemSz = arrVal(item, 'size') || sz;
-        if (price > 0 && itemSz) pricing[itemSz] = price;
-      });
-
-    } catch(e) {
-      firstError = firstError || e.message;
-    }
-  }
-
-  if (Object.keys(pricing).length === 0) {
-    return { error: firstError || 'No pricing data returned', style: style, color: color };
-  }
-
-  function p(s) { return pricing[s] || null; }
-  // S price = base for S-XL (they're usually the same but fetch S specifically)
-  var sxl = p('S') || p('M') || p('L') || p('XL') || null;
-
-  return {
-    style: style, color: color,
-    priceSXL: sxl,
-    price2XL: p('2XL'),
-    price3XL: p('3XL'),
-    price4XL: p('4XL'),
-    raw: pricing,
-    note: 'Prices are your myPrice (dealer rate). Verify upcharges for extended sizes.'
-  };
-}
-
-
-async function fetchImageB64(style, color) {
-  var c = (color || '').replace(/\s+/g, '_').toUpperCase();
-  var urls = [
-    SM_IMG_BASE + style + '_' + (c || style) + '.jpg',
-    SM_IMG_BASE + style + '_' + style + '.jpg',
-    SM_IMG_BASE + style.toLowerCase() + '_' + style.toLowerCase() + '.jpg'
-  ];
-  for (var i = 0; i < urls.length; i++) {
-    try {
-      var r = await fetch(urls[i], { timeout: 7000 });
-      if (r.ok) {
-        var buf = await r.buffer();
-        if (buf.length > 1000) return buf.toString('base64');
-      }
-    } catch(e) { /* try next */ }
-  }
-  return null;
-}
-
-// Walk object finding key by suffix, ignoring namespace prefixes
-function findKey(obj, name) {
-  // Auto-unwrap single-element arrays (explicitArray:true wraps everything)
-  if (Array.isArray(obj)) obj = obj[0];
-  if (!obj || typeof obj !== 'object') return null;
-  var lower = name.toLowerCase();
-  var keys  = Object.keys(obj);
-  for (var i = 0; i < keys.length; i++) {
-    var k = keys[i].toLowerCase();
-    if (k === lower || k.slice(k.lastIndexOf(':') + 1) === lower) return obj[keys[i]];
-  }
-  return null;
-}
-
-function safeStr(val) {
-  if (val === null || val === undefined) return '';
-  if (typeof val === 'string') return val.trim();
-  if (Array.isArray(val)) return val.length > 0 ? safeStr(val[0]) : '';
-  if (typeof val === 'object' && val['_']) return String(val['_']).trim();
-  return '';
-}
-
-// Get first value from an explicitArray:true parsed object key
-function arrVal(obj, key) {
-  if (!obj) return '';
-  var found = findKey(obj, key);
-  if (!found) return '';
-  if (Array.isArray(found)) return safeStr(found[0]);
-  return safeStr(found);
-}
-
-// ─────────────────────────────────────
-app.listen(PORT, function() {
-  console.log('HVP SanMar Proxy v4 running on port ' + PORT);
-});
+module.exports = router;

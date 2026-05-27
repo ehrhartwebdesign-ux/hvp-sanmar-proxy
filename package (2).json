@@ -1,0 +1,194 @@
+'use strict';
+const express = require('express');
+const db      = require('../db');
+const { requireAuth } = require('../middleware/auth');
+const router  = express.Router();
+
+// GET /api/quotes?status=draft&customer_id=x
+router.get('/', requireAuth, async function(req, res) {
+  try {
+    var where = ['1=1'];
+    var params = [];
+    var n = 1;
+    // Staff see own quotes; admin sees all
+    if (req.employee.role !== 'admin') {
+      where.push('q.employee_id = $' + n++);
+      params.push(req.employee.id);
+    }
+    if (req.query.status) { where.push('q.status = $' + n++); params.push(req.query.status); }
+    if (req.query.customer_id) { where.push('q.customer_id = $' + n++); params.push(req.query.customer_id); }
+    if (req.query.q) {
+      where.push('(c.name ILIKE $' + n + ' OR q.quote_number ILIKE $' + n + ')');
+      params.push('%' + req.query.q + '%'); n++;
+    }
+    const r = await db.query(
+      `SELECT q.id, q.quote_number, q.status, q.created_at, q.updated_at,
+              q.expires_at, q.emailed_at, q.converted_at,
+              c.name as customer_name, c.email as customer_email,
+              e.name as employee_name,
+              jsonb_array_length(q.items) as item_count
+       FROM quotes q
+       LEFT JOIN customers c ON c.id = q.customer_id
+       LEFT JOIN employees e ON e.id = q.employee_id
+       WHERE ${where.join(' AND ')}
+       ORDER BY q.updated_at DESC LIMIT 100`,
+      params
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/quotes/expiring — quotes expiring in next 3 days
+router.get('/expiring', requireAuth, async function(req, res) {
+  try {
+    var r = await db.query(
+      `SELECT q.quote_number, q.expires_at, c.name as customer_name,
+              c.email as customer_email, e.name as employee_name, q.id
+       FROM quotes q
+       LEFT JOIN customers c ON c.id=q.customer_id
+       LEFT JOIN employees e ON e.id=q.employee_id
+       WHERE q.status IN ('draft','sent')
+         AND q.expires_at BETWEEN NOW() AND NOW() + INTERVAL '3 days'
+         AND ($1 = 'admin' OR q.employee_id = $2)
+       ORDER BY q.expires_at`,
+      [req.employee.role, req.employee.id]
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/quotes/:id
+router.get('/:id', requireAuth, async function(req, res) {
+  try {
+    const r = await db.query(
+      `SELECT q.*, c.name as customer_name, c.email as customer_email,
+              c.contact as customer_contact, c.phone as customer_phone,
+              e.name as employee_name, e.email as employee_email
+       FROM quotes q
+       LEFT JOIN customers c ON c.id=q.customer_id
+       LEFT JOIN employees e ON e.id=q.employee_id
+       WHERE q.id=$1`, [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+    const q = r.rows[0];
+    // Check access
+    if (req.employee.role !== 'admin' && q.employee_id !== req.employee.id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    // Load artwork
+    const art = await db.query(
+      'SELECT id,filename,mime_type,size_bytes,created_at FROM artwork WHERE quote_id=$1',
+      [req.params.id]
+    );
+    q.artwork = art.rows;
+    // Load email log
+    const emails = await db.query(
+      `SELECT el.*, e.name as sent_by_name FROM email_log el
+       LEFT JOIN employees e ON e.id=el.sent_by
+       WHERE el.quote_id=$1 ORDER BY el.sent_at DESC`,
+      [req.params.id]
+    );
+    q.email_log = emails.rows;
+    res.json(q);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/quotes — create new quote
+router.post('/', requireAuth, async function(req, res) {
+  try {
+    const { customer_id, items, internal_notes, customer_notes, markup, expires_days } = req.body;
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + (expires_days || 30));
+    const r = await db.query(
+      `INSERT INTO quotes (customer_id, employee_id, items, internal_notes, customer_notes, markup, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [customer_id||null, req.employee.id, JSON.stringify(items||[]),
+       internal_notes||null, customer_notes||null, markup||1.90, expiresAt]
+    );
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/quotes/:id — update quote
+router.put('/:id', requireAuth, async function(req, res) {
+  try {
+    const { customer_id, items, internal_notes, customer_notes, markup, status, expires_days } = req.body;
+    // Check ownership
+    const existing = await db.query('SELECT employee_id, status FROM quotes WHERE id=$1', [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: 'Not found' });
+    if (req.employee.role !== 'admin' && existing.rows[0].employee_id !== req.employee.id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    var expiresAt = null;
+    if (expires_days) { expiresAt = new Date(); expiresAt.setDate(expiresAt.getDate() + expires_days); }
+    var convertedAt = (status === 'converted') ? new Date() : null;
+    const r = await db.query(
+      `UPDATE quotes SET
+         customer_id=COALESCE($1,customer_id),
+         items=COALESCE($2,items),
+         internal_notes=COALESCE($3,internal_notes),
+         customer_notes=COALESCE($4,customer_notes),
+         markup=COALESCE($5,markup),
+         status=COALESCE($6,status),
+         expires_at=COALESCE($7,expires_at),
+         converted_at=COALESCE($8,converted_at)
+       WHERE id=$9 RETURNING *`,
+      [customer_id||null, items?JSON.stringify(items):null,
+       internal_notes, customer_notes, markup, status,
+       expiresAt, convertedAt, req.params.id]
+    );
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/quotes/:id — admin only or own draft
+router.delete('/:id', requireAuth, async function(req, res) {
+  try {
+    const existing = await db.query('SELECT employee_id,status FROM quotes WHERE id=$1', [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: 'Not found' });
+    const q = existing.rows[0];
+    if (req.employee.role !== 'admin' && (q.employee_id !== req.employee.id || q.status !== 'draft')) {
+      return res.status(403).json({ error: 'Can only delete your own draft quotes' });
+    }
+    await db.query('DELETE FROM quotes WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/quotes/:id/artwork — upload artwork file
+router.post('/:id/artwork', requireAuth, async function(req, res) {
+  try {
+    const { filename, mime_type, data_b64 } = req.body;
+    if (!filename || !data_b64) return res.status(400).json({ error: 'filename and data_b64 required' });
+    const sizeBytes = Math.round((data_b64.length * 3) / 4);
+    if (sizeBytes > 10 * 1024 * 1024) return res.status(400).json({ error: 'File too large (max 10MB)' });
+    const r = await db.query(
+      'INSERT INTO artwork (quote_id,filename,mime_type,data_b64,size_bytes,uploaded_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,filename,mime_type,size_bytes,created_at',
+      [req.params.id, filename, mime_type||'application/octet-stream', data_b64, sizeBytes, req.employee.id]
+    );
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/quotes/:id/artwork/:artId — download artwork
+router.get('/:id/artwork/:artId', requireAuth, async function(req, res) {
+  try {
+    const r = await db.query('SELECT * FROM artwork WHERE id=$1 AND quote_id=$2', [req.params.artId, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+    const art = r.rows[0];
+    const buf = Buffer.from(art.data_b64, 'base64');
+    res.set('Content-Type', art.mime_type);
+    res.set('Content-Disposition', 'attachment; filename="' + art.filename + '"');
+    res.send(buf);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/quotes/:id/artwork/:artId
+router.delete('/:id/artwork/:artId', requireAuth, async function(req, res) {
+  try {
+    await db.query('DELETE FROM artwork WHERE id=$1 AND quote_id=$2', [req.params.artId, req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+module.exports = router;
