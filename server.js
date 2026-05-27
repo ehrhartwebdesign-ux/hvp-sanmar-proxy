@@ -501,16 +501,17 @@ async function getPricing(username, password, customerNumber, style, color) {
         continue;
       }
 
-      // Get price from listResponse - it may contain multiple items (one per size/color)
+      // listResponse = single item per call (one size queried at a time)
+      // myPrice = your dealer/account rate, piecePrice = standard retail price
       var listRaw = findKey(ret, 'listResponse');
       if (!listRaw) continue;
       var items = Array.isArray(listRaw) ? listRaw : [listRaw];
-
       items.filter(Boolean).forEach(function(item) {
-        // myPrice = your dealer price, piecePrice = standard piece price
-        var price = parseFloat(arrVal(item, 'myPrice') || arrVal(item, 'piecePrice') || '0');
-        var itemSize = arrVal(item, 'size') || sz;
-        if (price > 0) pricing[itemSize] = price;
+        var myP    = parseFloat(arrVal(item, 'myPrice')    || '0');
+        var pieceP = parseFloat(arrVal(item, 'piecePrice') || '0');
+        var price  = myP > 0 ? myP : pieceP;
+        var itemSz = arrVal(item, 'size') || sz;
+        if (price > 0 && itemSz) pricing[itemSz] = price;
       });
 
     } catch(e) {
@@ -523,6 +524,7 @@ async function getPricing(username, password, customerNumber, style, color) {
   }
 
   function p(s) { return pricing[s] || null; }
+  // S price = base for S-XL (they're usually the same but fetch S specifically)
   var sxl = p('S') || p('M') || p('L') || p('XL') || null;
 
   return {
@@ -531,7 +533,8 @@ async function getPricing(username, password, customerNumber, style, color) {
     price2XL: p('2XL'),
     price3XL: p('3XL'),
     price4XL: p('4XL'),
-    raw: pricing
+    raw: pricing,
+    note: 'Prices are your myPrice (dealer rate). Verify upcharges for extended sizes.'
   };
 }
 
