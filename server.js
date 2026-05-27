@@ -560,6 +560,8 @@ async function fetchImageB64(style, color) {
 
 // Walk object finding key by suffix, ignoring namespace prefixes
 function findKey(obj, name) {
+  // Auto-unwrap single-element arrays (explicitArray:true wraps everything)
+  if (Array.isArray(obj)) obj = obj[0];
   if (!obj || typeof obj !== 'object') return null;
   var lower = name.toLowerCase();
   var keys  = Object.keys(obj);
