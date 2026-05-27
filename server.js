@@ -245,11 +245,17 @@ app.get('/api/image/:style', async function(req, res) {
   try {
     var style = req.params.style.toUpperCase();
     var color = (req.query.color || '').replace(/\s+/g, '_').toUpperCase();
+    // Build color-specific URL variants
+    var colorCode = (color || '').toUpperCase().replace(/\s+/g, '_').replace(/[^A-Z0-9_]/g, '');
+    var colorCode2 = (color || '').toUpperCase().replace(/\s+/g, '-').replace(/[^A-Z0-9-]/g, '');
+    var colorShort = (color || '').toUpperCase().replace(/\s+/g, '').substring(0, 8);
     var urls = [
-      SM_IMG_BASE + style + '_' + (color || style) + '.jpg',
+      SM_IMG_BASE + style + '_' + colorCode + '.jpg',
+      SM_IMG_BASE + style + '_' + colorCode2 + '.jpg',
+      SM_IMG_BASE + style + '_' + colorShort + '.jpg',
       SM_IMG_BASE + style + '_' + style + '.jpg',
       SM_IMG_BASE + style.toLowerCase() + '_' + style.toLowerCase() + '.jpg'
-    ];
+    ].filter(function(u,i,a){ return a.indexOf(u)===i; }); // dedupe
     for (var i = 0; i < urls.length; i++) {
       try {
         var r = await fetch(urls[i], { timeout: 8000 });
@@ -292,13 +298,19 @@ app.post('/api/specsheet', async function(req, res) {
     var fm   = desc.match(/(\d+%[^.\n]{3,60}(?:cotton|polyester|fleece|blend|jersey|pique|spandex)[^.\n]*)/i);
     var feats = desc.split(/[.\n]/).map(function(s){ return s.trim(); }).filter(function(s){ return s.length > 10 && s.length < 140; });
 
+    // Use SanMar's own bullets if available, else parse from description
+    var bullets = productData.bullets && productData.bullets.length > 1
+      ? productData.bullets
+      : feats.slice(0, 8);
+
     res.json({
       style: style,
       name: productData.name,
       description: desc,
+      bullets: bullets,
       fabric: fm ? fm[1].trim() : null,
       weight: wm ? wm[1].trim() : null,
-      features: feats.slice(0, 8),
+      features: bullets,
       colors: productData.colors || [],
       sizes: productData.sizes || ['XS','S','M','L','XL','2XL','3XL','4XL'],
       imageB64: imgB64
@@ -373,12 +385,14 @@ async function getProduct(username, password, style) {
     // productName is a single tag -> ['Port & Co...'] with explicitArray:true
     var name = arrVal(product, 'productName') || style;
 
-    // description is MULTIPLE tags -> array of strings; join them
+    // description is MULTIPLE tags -> keep as array for bullet points
     var descRaw = findKey(product, 'description') || [];
     var descArr = Array.isArray(descRaw) ? descRaw : [descRaw];
-    var description = descArr.map(function(d) {
+    var bullets = descArr.map(function(d) {
       return typeof d === 'string' ? d.trim() : (d && d['_'] ? d['_'].trim() : '');
-    }).filter(Boolean).join(' ');
+    }).filter(function(d){ return d.length > 2; });
+    // Also join for backwards compat
+    var description = bullets.join(' ');
 
     // Colors and sizes from ProductPartArray
     var colors = [], sizes = [];
@@ -410,7 +424,7 @@ async function getProduct(username, password, style) {
       });
     }
 
-    return { style: style, name: name, description: description, colors: colors, sizes: sizes };
+    return { style: style, name: name, description: description, bullets: bullets, colors: colors, sizes: sizes };
 
   } catch(e) {
     return { error: 'Parse error: ' + e.message + ' at: ' + (e.stack||'').split('\n')[1], rawStart: text.substring(0, 600) };
